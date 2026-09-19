@@ -27,6 +27,14 @@
   ],
   "author": "Kevin Ruschman (KruschDev)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kruschdev/krusch.git"
+  },
+  "homepage": "https://github.com/kruschdev/krusch#readme",
+  "bugs": {
+    "url": "https://github.com/kruschdev/krusch/issues"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.0",
     "chalk": "^5.4.1",
