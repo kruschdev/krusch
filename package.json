@@ -1,0 +1,39 @@
+{
+  "name": "krusch",
+  "version": "1.0.0",
+  "description": "The sovereign, PostgreSQL-grounded coding harness for interchangeable LLMs.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "krusch": "./bin/krusch.js"
+  },
+  "scripts": {
+    "start": "node bin/krusch.js",
+    "mcp": "node bin/krusch.js mcp",
+    "test": "node --test test/unit/*.test.js test/integration/*.test.js",
+    "test:unit": "node --test test/unit/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js",
+    "migrate": "node db/migrate.js"
+  },
+  "keywords": [
+    "coding-harness",
+    "agentic-ai",
+    "postgres",
+    "pgvector",
+    "llm-router",
+    "cascade",
+    "dbos",
+    "mcp"
+  ],
+  "author": "Kevin Ruschman (KruschDev)",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "dotenv": "^16.4.7",
+    "krusch-cascade-router": "file:../krusch-cascade-router",
+    "krusch-pre-router": "file:../krusch-pre-router",
+    "pg": "^8.13.3"
+  }
+}
