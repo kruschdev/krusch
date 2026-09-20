@@ -1,0 +1,232 @@
+/**
+ * Type declarations for Krusch Coding Harness.
+ * PostgreSQL-grounded control plane for multi-model coding agents.
+ */
+
+export interface TaskRecord {
+  id: string;
+  goal: string;
+  project_path: string;
+  phase: HarnessPhase;
+  current_model: string | null;
+  metadata: Record<string, any>;
+  created_at: string;
+  updated_at: string;
+  turns?: TurnRecord[];
+  stagedDiffs?: StagedDiffRecord[];
+  approvals?: ApprovalRecord[];
+  verifications?: VerificationRunRecord[];
+}
+
+export type HarnessPhase =
+  | 'INIT'
+  | 'PLAN'
+  | 'IMPLEMENT'
+  | 'VERIFY'
+  | 'APPROVAL_GATE'
+  | 'COMMITTED'
+  | 'ABORTED';
+
+export const HARNESS_PHASES: Record<HarnessPhase, HarnessPhase>;
+
+export interface TurnRecord {
+  id: number;
+  task_id: string;
+  turn_number: number;
+  model_id: string;
+  input_messages: any[];
+  output_text: string | null;
+  thought_trace: string | null;
+  token_usage: Record<string, any>;
+  latency_ms: number | null;
+  routing_stage: string | null;
+  created_at: string;
+}
+
+export interface StagedDiffRecord {
+  id: number;
+  task_id: string;
+  file_path: string;
+  original_content: string | null;
+  staged_content: string;
+  diff_patch: string | null;
+  status: 'PENDING' | 'APPLIED' | 'REJECTED';
+  sha256_hash: string;
+  original_sha256: string | null;
+  created_at: string;
+  applied_at: string | null;
+}
+
+export interface ApprovalRecord {
+  id: number;
+  task_id: string;
+  action_type: string;
+  target_resource: string;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'AUTO_BYPASSED';
+  requested_by_model: string | null;
+  decision_reason: string | null;
+  created_at: string;
+  decided_at: string | null;
+}
+
+export interface VerificationRunRecord {
+  id: number;
+  task_id: string;
+  command: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  passed: boolean;
+  failure_module: string | null;
+  extracted_errors: any[];
+  created_at: string;
+}
+
+export class KruschFSM {
+  taskId: string;
+  currentPhase: HarnessPhase;
+  constructor(taskId: string, initialPhase?: HarnessPhase);
+  syncPhase(): Promise<HarnessPhase>;
+  canTransitionTo(targetPhase: HarnessPhase, fromPhase?: HarnessPhase | null): boolean;
+  transitionTo(targetPhase: HarnessPhase, metadata?: Record<string, any>): Promise<{ from: HarnessPhase; to: HarnessPhase }>;
+}
+
+export class KruschStateManager {
+  static createTask(params: {
+    id?: string;
+    goal: string;
+    projectPath: string;
+    phase?: HarnessPhase;
+    currentModel?: string | null;
+    metadata?: Record<string, any>;
+  }): Promise<TaskRecord>;
+
+  static updateTask(
+    taskId: string,
+    params: { phase?: HarnessPhase; currentModel?: string; metadata?: Record<string, any> }
+  ): Promise<TaskRecord>;
+
+  static getTask(taskId: string): Promise<TaskRecord | null>;
+
+  static recordTurn(
+    taskId: string,
+    turn: {
+      turnNumber: number;
+      modelId: string;
+      inputMessages: any[];
+      outputText?: string | null;
+      thoughtTrace?: string | null;
+      tokenUsage?: Record<string, any>;
+      latencyMs?: number | null;
+      routingStage?: string;
+    }
+  ): Promise<TurnRecord>;
+
+  static recordEvent(taskId: string, turnId: number | null, eventType: string, payload: any): Promise<any>;
+
+  static stageDiff(
+    taskId: string,
+    diff: {
+      filePath: string;
+      originalContent?: string | null;
+      stagedContent: string;
+      diffPatch?: string;
+    }
+  ): Promise<StagedDiffRecord>;
+
+  static getPendingDiffs(taskId: string): Promise<StagedDiffRecord[]>;
+
+  static updateDiffStatus(diffId: number, status: 'PENDING' | 'APPLIED' | 'REJECTED'): Promise<StagedDiffRecord>;
+
+  static requestApproval(
+    taskId: string,
+    approval: {
+      actionType: string;
+      targetResource: string;
+      requestedByModel?: string;
+      status?: string;
+      decisionReason?: string | null;
+    }
+  ): Promise<ApprovalRecord>;
+
+  static decideApproval(approvalId: number, status: string, decisionReason?: string): Promise<ApprovalRecord>;
+
+  static recordVerificationRun(
+    taskId: string,
+    run: {
+      command: string;
+      exitCode: number;
+      stdout: string;
+      stderr: string;
+      passed: boolean;
+      failureModule?: string | null;
+      extractedErrors?: any[];
+    }
+  ): Promise<VerificationRunRecord>;
+
+  static getLatestVerificationRun(taskId: string, client?: any): Promise<VerificationRunRecord | null>;
+
+  static hasUnappliedStagedDiffs(taskId: string, client?: any): Promise<boolean>;
+
+  static hasAnyStagedDiffs(taskId: string, client?: any): Promise<boolean>;
+
+  static atomicTransitionPhase(
+    taskId: string,
+    targetPhase: HarnessPhase,
+    allowedSourcePhases?: HarnessPhase[],
+    guardValidator?: (ctx: { task: TaskRecord; client: any; targetPhase: HarnessPhase }) => Promise<void>,
+    metadata?: Record<string, any>
+  ): Promise<{ from: HarnessPhase; to: HarnessPhase; task: TaskRecord }>;
+}
+
+export class KruschCascadeRouter {
+  specialists: Record<string, any>;
+  constructor(options?: { specialists?: Record<string, any> });
+  route(prompt: string, context?: Record<string, any>): Promise<{
+    selectedModel: string;
+    tier: string;
+    confidence: number;
+    reasoning: string;
+    stage: string;
+  }>;
+}
+
+export class KruschTools {
+  taskId: string;
+  projectPath: string;
+  policy: any;
+  constructor(taskId: string, projectPath: string, options?: { autoApprove?: boolean });
+  getToolDefinitions(): any[];
+  executeTool(name: string, args?: Record<string, any>): Promise<any>;
+}
+
+export class KruschStateMachine {
+  constructor(options?: any);
+  run(goal: string, options?: any): Promise<any>;
+}
+
+export class KruschTrajectoryGuard {
+  constructor(options?: { maxTurns?: number; loopWindowSize?: number });
+  recordAction(action: any): { loopDetected: boolean; turnsExceeded: boolean; reason?: string };
+}
+
+export class KruschModularRSI {
+  static attributeFailure(errorOutput: string): { module: string; diagnosis: string; recoveryPrompt: string };
+}
+
+export class KruschTestRunner {
+  static runCommand(command: string, cwd: string): Promise<{
+    command: string;
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    passed: boolean;
+  }>;
+}
+
+export class KruschApprovalPolicy {
+  constructor(rules?: any);
+  evaluate(actionType: string, args: any): { status: string; reason?: string };
+}
+
+export function startMcpServer(): Promise<void>;

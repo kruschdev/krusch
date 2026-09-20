@@ -226,6 +226,133 @@ test('Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporar
   }
 });
 
+test('Enforcement: Database trigger rejects illegal phase transitions at PostgreSQL catalog level', async () => {
+  const taskId = `trg_test_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test PostgreSQL trigger-enforced FSM transitions',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.INIT
+  });
+
+  // 1. Attempt illegal transition directly via raw SQL: INIT -> COMMITTED
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('Invalid FSM transition: cannot transition from INIT to COMMITTED'));
+      return true;
+    }
+  );
+
+  // 2. Legal transition: INIT -> PLAN
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.PLAN, taskId]);
+  const taskAfterPlan = await KruschStateManager.getTask(taskId);
+  assert.strictEqual(taskAfterPlan.phase, HARNESS_PHASES.PLAN);
+
+  // 3. Attempt illegal transition directly via raw SQL: PLAN -> VERIFY (skipping IMPLEMENT)
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.VERIFY, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('Invalid FSM transition: cannot transition from PLAN to VERIFY'));
+      return true;
+    }
+  );
+
+  // 4. Legal transition: PLAN -> COMMITTED (for read-only tasks)
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+  const taskAfterCommit = await KruschStateManager.getTask(taskId);
+  assert.strictEqual(taskAfterCommit.phase, HARNESS_PHASES.COMMITTED);
+
+  // 5. Attempt illegal mutation from terminal state: COMMITTED -> PLAN
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.PLAN, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('Terminal state: cannot transition from terminal phase COMMITTED'));
+      return true;
+    }
+  );
+});
+
+test('Enforcement: apply_staged_diff detects working tree drift and blocks overwrite', async () => {
+  const taskId = `drift_test_${Date.now()}`;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-test-drift-'));
+
+  try {
+    const targetRelFile = 'config.json';
+    const targetAbsFile = path.resolve(tempDir, targetRelFile);
+
+    // Initial file state
+    const originalFileContent = JSON.stringify({ version: '1.0.0', env: 'production' }, null, 2);
+    fs.writeFileSync(targetAbsFile, originalFileContent, 'utf-8');
+
+    await KruschStateManager.createTask({
+      id: taskId,
+      goal: 'Test working tree drift detection',
+      projectPath: tempDir,
+      phase: HARNESS_PHASES.VERIFY
+    });
+
+    const tools = new KruschTools(taskId, tempDir, { autoApprove: true });
+
+    // 1. Stage diff based on original content
+    const staged = await tools.executeTool('stage_diff', {
+      path: targetRelFile,
+      content: JSON.stringify({ version: '2.0.0', env: 'production' }, null, 2),
+      explanation: 'Upgrade version'
+    });
+    assert.strictEqual(staged.status, 'STAGED');
+
+    // 2. Simulate passing verification run and transition to APPROVAL_GATE
+    await KruschStateManager.recordVerificationRun(taskId, {
+      command: 'npm test',
+      exitCode: 0,
+      stdout: 'All checks green',
+      stderr: '',
+      passed: true
+    });
+
+    const fsm = new KruschFSM(taskId, HARNESS_PHASES.VERIFY);
+    await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
+
+    // 3. SIMULATE OUT-OF-BAND DISK MODIFICATION (Working Tree Drift)
+    // External user or process edits config.json while agent is in verification
+    const driftedContent = JSON.stringify({ version: '1.0.0', env: 'staging', uncommittedChange: true }, null, 2);
+    fs.writeFileSync(targetAbsFile, driftedContent, 'utf-8');
+
+    // 4. Attempt to apply staged diff - MUST FAIL with WORKING_TREE_DRIFT_DETECTED
+    const driftResult = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId });
+    assert.ok(driftResult.error, 'Should return error on disk drift');
+    assert.strictEqual(driftResult.error, 'WORKING_TREE_DRIFT_DETECTED');
+    assert.ok(driftResult.message.includes('working tree file'));
+
+    // Invariant check: disk content MUST NOT have been overwritten!
+    assert.strictEqual(
+      fs.readFileSync(targetAbsFile, 'utf-8'),
+      driftedContent,
+      'Live disk content must remain untouched after drift detection'
+    );
+
+    // 5. Restore disk content to original staged base
+    fs.writeFileSync(targetAbsFile, originalFileContent, 'utf-8');
+
+    // 6. Now apply should succeed
+    const validApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId });
+    assert.strictEqual(validApply.status, 'APPLIED');
+    assert.strictEqual(
+      fs.readFileSync(targetAbsFile, 'utf-8'),
+      JSON.stringify({ version: '2.0.0', env: 'production' }, null, 2)
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test.after(async () => {
   await pool.end();
 });

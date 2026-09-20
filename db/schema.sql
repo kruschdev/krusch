@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS krusch_staged_diffs (
     diff_patch TEXT,
     status VARCHAR(32) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPLIED', 'REJECTED')),
     sha256_hash VARCHAR(64),
+    original_sha256 VARCHAR(64),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     applied_at TIMESTAMP WITH TIME ZONE
 );
@@ -113,4 +114,52 @@ BEGIN
     ) THEN
         ALTER TABLE krusch_staged_diffs ADD COLUMN applied_at TIMESTAMP WITH TIME ZONE;
     END IF;
+
+    -- krusch_staged_diffs original_sha256 column
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'krusch_staged_diffs' AND column_name = 'original_sha256'
+    ) THEN
+        ALTER TABLE krusch_staged_diffs ADD COLUMN original_sha256 VARCHAR(64);
+    END IF;
 END $$;
+
+-- Enforce valid FSM state transitions directly in PostgreSQL catalog
+CREATE OR REPLACE FUNCTION check_krusch_task_phase_transition()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- No change in phase: allow
+    IF OLD.phase = NEW.phase THEN
+        RETURN NEW;
+    END IF;
+
+    -- Enforce legal transition graph
+    IF OLD.phase = 'INIT' AND NEW.phase NOT IN ('PLAN', 'ABORTED') THEN
+        RAISE EXCEPTION 'Invalid FSM transition: cannot transition from % to %', OLD.phase, NEW.phase
+            USING ERRCODE = 'check_violation';
+    ELSIF OLD.phase = 'PLAN' AND NEW.phase NOT IN ('IMPLEMENT', 'COMMITTED', 'ABORTED') THEN
+        RAISE EXCEPTION 'Invalid FSM transition: cannot transition from % to %', OLD.phase, NEW.phase
+            USING ERRCODE = 'check_violation';
+    ELSIF OLD.phase = 'IMPLEMENT' AND NEW.phase NOT IN ('VERIFY', 'ABORTED') THEN
+        RAISE EXCEPTION 'Invalid FSM transition: cannot transition from % to %', OLD.phase, NEW.phase
+            USING ERRCODE = 'check_violation';
+    ELSIF OLD.phase = 'VERIFY' AND NEW.phase NOT IN ('APPROVAL_GATE', 'IMPLEMENT', 'ABORTED') THEN
+        RAISE EXCEPTION 'Invalid FSM transition: cannot transition from % to %', OLD.phase, NEW.phase
+            USING ERRCODE = 'check_violation';
+    ELSIF OLD.phase = 'APPROVAL_GATE' AND NEW.phase NOT IN ('COMMITTED', 'IMPLEMENT', 'ABORTED') THEN
+        RAISE EXCEPTION 'Invalid FSM transition: cannot transition from % to %', OLD.phase, NEW.phase
+            USING ERRCODE = 'check_violation';
+    ELSIF OLD.phase IN ('COMMITTED', 'ABORTED') THEN
+        RAISE EXCEPTION 'Terminal state: cannot transition from terminal phase % to %', OLD.phase, NEW.phase
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_krusch_task_phase_transition ON krusch_tasks;
+CREATE TRIGGER trg_krusch_task_phase_transition
+    BEFORE UPDATE OF phase ON krusch_tasks
+    FOR EACH ROW
+    EXECUTE FUNCTION check_krusch_task_phase_transition();

@@ -170,6 +170,27 @@ export class KruschTools {
       const targetDir = path.dirname(fullPath);
       fs.mkdirSync(targetDir, { recursive: true });
 
+      // Hard Invariant Guard: Working Tree Drift Detection
+      // Ensure file on disk has not been modified out-of-band since diff was staged
+      const diskFileExists = fs.existsSync(fullPath);
+      const currentDiskContent = diskFileExists ? fs.readFileSync(fullPath, 'utf-8') : null;
+      const currentDiskHash = (currentDiskContent !== null && currentDiskContent !== '')
+        ? crypto.createHash('sha256').update(currentDiskContent).digest('hex')
+        : null;
+
+      const expectedOriginalHash = target.original_sha256 || (
+        (target.original_content !== null && target.original_content !== undefined && target.original_content !== '')
+          ? crypto.createHash('sha256').update(target.original_content).digest('hex')
+          : null
+      );
+
+      if (currentDiskHash !== expectedOriginalHash) {
+        return {
+          error: 'WORKING_TREE_DRIFT_DETECTED',
+          message: `Refusing to apply staged diff to disk: working tree file '${target.file_path}' was modified after diff was staged. Expected base hash: ${expectedOriginalHash || 'none'}, current disk hash: ${currentDiskHash || 'none'}. Staged diff must be rebased and re-verified.`
+        };
+      }
+
       // Crash-Safe Atomic Apply:
       // 1. Write staged content to sibling temporary file
       // 2. fsync to force physical flush to storage media

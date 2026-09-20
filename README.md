@@ -5,10 +5,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Node-%3E%3D18-blue.svg?style=flat-square" alt="Node Version">
-  <img src="https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-blue.svg?style=flat-square" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/PostgreSQL-16%20Transactional-blue.svg?style=flat-square" alt="PostgreSQL">
   <img src="https://img.shields.io/badge/Routing-krusch--pre--router%20%2B%20cascade-green.svg?style=flat-square" alt="Routing">
-  <img src="https://img.shields.io/badge/FSM-Enforced%20Verification%20Gate-orange.svg?style=flat-square" alt="FSM Enforced">
-  <img src="https://img.shields.io/badge/tests-19%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/FSM-DB--Level%20Trigger%20Guarded-orange.svg?style=flat-square" alt="DB FSM Enforced">
+  <img src="https://img.shields.io/badge/tests-21%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 ---
@@ -22,8 +22,22 @@
 Frontier and open-weights models churn rapidly. Most agent frameworks couple their execution loop to a single provider API and an ephemeral, in-process transcript. `krusch` stores primary state in PostgreSQL:
 * **Durable Task State**: Tasks, turns, execution events, and staged file diffs are persisted in PostgreSQL (`krusch_*` tables). If an LLM times out, hits a rate limit, or requires escalation, the next model resumes from the authoritative database record.
 * **Pre-Commit Staging & Crash-Safe Apply**: Model file edits are hashed and staged in PostgreSQL first. Physical disk files are only written when ground-truth verification passes, using atomic write + `fsync` + rename semantics.
-* **Fast Heuristic Routing**: Evaluates syntax, SQL, and closed-world queries on CPU (<15µs, $0.00) before dispatching to specialized models or escalating to frontier reasoning.
-* **Database-Enforced Invariant FSM**: Phase transitions and verification gates are guarded by PostgreSQL row-level locks and `CHECK` constraints, preventing multi-process state drift.
+* **Working Tree Drift Protection**: Staged diff apply employs optimistic concurrency control, verifying that live disk files have not drifted out-of-band before writing.
+* **Fast Heuristic Routing**: Evaluates syntax, SQL, and closed-world queries on CPU (<15µs, $0.00) via sibling routers before dispatching to specialized models or escalating to frontier reasoning.
+* **Database-Level Invariant FSM**: Phase transitions and verification gates are guarded both by PostgreSQL transaction row locks (`SELECT ... FOR UPDATE`) and database-level `BEFORE UPDATE` triggers and `CHECK` constraints.
+
+---
+
+## 🌐 Ecosystem Architecture & Stack Division
+
+`krusch` is part of a decoupled stack designed for sovereign agent engineering:
+
+| Layer | Package | Responsibility |
+|---|---|---|
+| **Control Plane & Harness** | `krusch` (This Repo) | Durable PostgreSQL task/turn FSM, ACID pre-commit diff staging, optimistic concurrency guards, failure attribution (`KruschModularRSI`), and CLI/MCP runner. |
+| **Context & Memory Engine** | `krusch-context-mcp` | Tree-sitter AST symbol indexing, repository topology, token budgeting, and pgvector embeddings for episodic memory. |
+| **Fast L1 CPU Gate** | `krusch-pre-router` | Zero-cost (<15µs, $0.00) CPU heuristic intercept for syntactic, SQL, and closed-world tasks. |
+| **Specialist Cascade** | `krusch-cascade-router` | Dynamic routing between cost-efficient specialist models and frontier reasoning models. |
 
 ---
 
@@ -49,10 +63,11 @@ stateDiagram-v2
 
 ### Hard Invariants
 1. **No Disk Writes on Failure**: `apply_staged_diff` is rejected unless the task is in `APPROVAL_GATE` and the latest verification run passed with `exit_code: 0`.
-2. **Transition Gate**: `VERIFY ➔ APPROVAL_GATE` is strictly blocked unless at least one verification run executed and the true latest run passed.
-3. **No Staged Diff Shortcuts**: `PLAN ➔ COMMITTED` is strictly forbidden if any staged diffs exist. All code modifications must pass through `IMPLEMENT ➔ VERIFY ➔ APPROVAL_GATE`.
-4. **Crash-Safe Apply**: Disk mutations use atomic file replacement (temp file write, `fsync`, and POSIX rename) before updating PostgreSQL diff status to `APPLIED`.
-5. **Database-Level Authority**: FSM state transitions execute inside PostgreSQL transactions with `SELECT ... FOR UPDATE` row locks, backed by a SQL `CHECK` constraint.
+2. **Optimistic Working Tree Drift Detection**: `apply_staged_diff` verifies SHA-256 base hashes against the live disk file to reject overwrites if the file was modified externally during verification.
+3. **Transition Gate**: `VERIFY ➔ APPROVAL_GATE` is strictly blocked unless at least one verification run executed and the true latest run passed.
+4. **No Staged Diff Shortcuts**: `PLAN ➔ COMMITTED` is strictly forbidden if any staged diffs exist. All code modifications must pass through `IMPLEMENT ➔ VERIFY ➔ APPROVAL_GATE`.
+5. **Crash-Safe Apply**: Disk mutations use atomic file replacement (temp file write, `fsync`, and POSIX rename) before updating PostgreSQL diff status to `APPLIED`.
+6. **Database-Level Authority**: State transitions are enforced at the PostgreSQL engine level via a `BEFORE UPDATE` trigger function (`check_krusch_task_phase_transition`), preventing illegal transitions even from raw SQL mutations.
 
 ---
 
@@ -113,22 +128,24 @@ Connects over stdio, exposing `krusch_run`, `krusch_route`, `krusch_task_status`
 
 ## 🧪 Verification & Test Suite
 
-The test suite validates router decisions, tool normalizers, trajectory loop guards, failure attribution, PostgreSQL persistence, and strict disk mutation blocking on test failure:
+The test suite validates router decisions, tool normalizers, trajectory loop guards, failure attribution, PostgreSQL persistence, database-level triggers, and strict disk mutation blocking on test failure:
 
 ```bash
 # Run unit tests (12 tests)
 npm run test:unit
 
-# Run PostgreSQL integration & enforcement tests (7 tests)
+# Run PostgreSQL integration & enforcement tests (9 tests)
 npm run test:integration
 
-# Run entire suite (19 tests)
+# Run entire suite (21 tests)
 npm test
 ```
 
 ### Test Coverage Highlights:
 * `✔ Enforcement: Test suite runs against live PostgreSQL with active CHECK constraints`
 * `✔ Enforcement: In-database phase constraint rejects invalid phase mutations at SQL layer`
+* `✔ Enforcement: Database trigger rejects illegal phase transitions at PostgreSQL catalog level`
+* `✔ Enforcement: apply_staged_diff detects working tree drift and blocks overwrite`
 * `✔ Enforcement: Latest verification run strictly respects chronological ordering (ORDER BY id DESC, created_at DESC)`
 * `✔ Enforcement: PLAN -> COMMITTED shortcut is strictly forbidden when staged diffs exist`
 * `✔ Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporary directory`
@@ -174,6 +191,8 @@ krusch/
 │   │   └── index.js            # Standard tools (read, stage_diff, crash-safe apply)
 │   └── server/
 │       └── mcp-server.js       # Model Context Protocol stdio server
+├── types/
+│   └── index.d.ts              # Full TypeScript declarations for control plane API
 └── test/
     ├── unit/                   # Router, normalizer, trajectory guard, modular-rsi tests
     └── integration/            # Postgres state lifecycle, FSM invariants & crash-safe apply

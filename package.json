@@ -4,6 +4,7 @@
   "description": "The sovereign, PostgreSQL-grounded coding harness for interchangeable LLMs.",
   "type": "module",
   "main": "src/index.js",
+  "types": "types/index.d.ts",
   "bin": {
     "krusch": "./bin/krusch.js"
   },

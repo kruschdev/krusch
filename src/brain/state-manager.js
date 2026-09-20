@@ -113,12 +113,15 @@ export class KruschStateManager {
    */
   static async stageDiff(taskId, { filePath, originalContent, stagedContent, diffPatch }) {
     const hash = crypto.createHash('sha256').update(stagedContent).digest('hex');
+    const originalHash = (originalContent !== null && originalContent !== undefined && originalContent !== '')
+      ? crypto.createHash('sha256').update(originalContent).digest('hex')
+      : null;
     const sql = `
-      INSERT INTO krusch_staged_diffs (task_id, file_path, original_content, staged_content, diff_patch, status, sha256_hash, created_at)
-      VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, NOW())
+      INSERT INTO krusch_staged_diffs (task_id, file_path, original_content, staged_content, diff_patch, status, sha256_hash, original_sha256, created_at)
+      VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, NOW())
       RETURNING *;
     `;
-    const res = await query(sql, [taskId, filePath, originalContent, stagedContent, diffPatch, hash]);
+    const res = await query(sql, [taskId, filePath, originalContent, stagedContent, diffPatch, hash, originalHash]);
     return res.rows[0];
   }
 
