@@ -9,11 +9,30 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.resolve(__dirname, '..', '.env'), quiet: true });
 
-const connectionString = process.env.DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
+const DEFAULT_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/krusch';
+const connectionString = process.env.DATABASE_URL || DEFAULT_DATABASE_URL;
 
 export async function migrate() {
-  const pool = new pg.Pool({ connectionString });
-  const client = await pool.connect();
+  const pool = new pg.Pool({ connectionString, connectionTimeoutMillis: 5000 });
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    console.error(`\n================================================================================`);
+    console.error(`✗ Krusch Migration Error: Could not connect to PostgreSQL.`);
+    console.error(`  Target Database: ${connectionString.replace(/:[^:@]+@/, ':****@')}`);
+    console.error(`  Error details:   ${err.message}\n`);
+    console.error(`First-run bringup:`);
+    console.error(`  1. Start PostgreSQL:  docker compose up -d`);
+    console.error(`  2. Apply migrations:  npm run migrate`);
+    console.error(`  3. Run mock harness:  ./bin/krusch.js run "Add a test" --mock\n`);
+    console.error(`Or configure DATABASE_URL in .env:`);
+    console.error(`  DATABASE_URL=postgresql://postgres:postgres@localhost:5432/krusch`);
+    console.error(`================================================================================\n`);
+    await pool.end();
+    throw err;
+  }
+
   try {
     // 1. Ensure migrations tracking table exists
     await client.query(`

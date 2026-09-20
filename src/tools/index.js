@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { KruschStateManager, canonicalizePaths } from '../brain/state-manager.js';
 import { KruschContextClient } from '../brain/context-client.js';
 import { KruschTestRunner } from '../verify/test-runner.js';
+import { KruschVerificationContract } from '../verify/contract.js';
 import { KruschApprovalPolicy } from '../approvals/policy.js';
 
 export class KruschTools {
@@ -145,13 +146,13 @@ export class KruschTools {
       }
     }
 
-    // Phase Invariant 3: run_command is blocked in PLAN and requires explicit phase
+    // Phase Invariant 3: run_command is strictly limited to VERIFY phase
     if (name === 'run_command') {
-      if (!options.phase || options.phase === 'PLAN') {
+      if (!options.phase || options.phase !== 'VERIFY') {
         return {
           status: 'BLOCKED',
           error: 'INVARIANT_VIOLATION',
-          message: `Command execution is prohibited during PLAN phase or without explicit phase (received '${options.phase || 'none'}').`
+          message: `Command execution is strictly prohibited outside VERIFY phase or without explicit phase (received '${options.phase || 'none'}'). Models may not execute shell commands during PLAN or IMPLEMENT.`
         };
       }
     }
@@ -268,7 +269,12 @@ export class KruschTools {
       if (!args.command || typeof args.command !== 'string') {
         return { error: 'Invalid command: command must be a non-empty string.' };
       }
-      const result = await KruschTestRunner.runCommand(args.command, this.projectPath);
+      const pendingDiffs = await KruschStateManager.getPendingDiffs(this.taskId);
+      const result = await KruschVerificationContract.runInStagedTree(
+        this.projectPath,
+        pendingDiffs,
+        { command: args.command }
+      );
       await KruschStateManager.recordVerificationRun(this.taskId, {
         command: args.command,
         exitCode: result.exitCode,

@@ -7,7 +7,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
 
-const connectionString = process.env.DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
+const DEFAULT_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/krusch';
+const connectionString = process.env.DATABASE_URL || DEFAULT_DATABASE_URL;
 
 let activePool = null;
 

@@ -11,10 +11,18 @@ import {
 
 import { KruschStateMachine } from '../workflow/state-machine.js';
 import { KruschStateManager } from '../brain/state-manager.js';
-import { KruschCascadeRouter, DEFAULT_SPECIALISTS } from '../router/cascade.js';
-import { KruschTools } from '../tools/index.js';
-import { KruschApprovalPolicy } from '../approvals/policy.js';
+import { query } from '../brain/pool.js';
+import crypto from 'crypto';
 
+/**
+ * Krusch MCP Server
+ *
+ * Exposes a thin, 4-tool async control plane interface for KD Code / IDEs:
+ * 1. krusch_run: Non-blocking asynchronous task dispatch.
+ * 2. krusch_task_status: Polling status endpoint with event timeline and verification state.
+ * 3. krusch_diff: Unified diff inspector for staged modifications in PostgreSQL.
+ * 4. krusch_apply_diff: Human approval trigger to 2PC journal and write working tree.
+ */
 export async function startMcpServer() {
   // Startup Crash Recovery & Lease Maintenance for long-lived MCP server
   try {
@@ -36,49 +44,27 @@ export async function startMcpServer() {
   );
 
   const stateMachine = new KruschStateMachine();
-  const router = new KruschCascadeRouter();
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
         {
           name: 'krusch_run',
-          description: 'Execute an engineering task through the Krusch invariant coding harness (Postgres state authority + interchangeable models).',
+          description: 'Asynchronously launch an engineering task in the Krusch harness. Returns immediately with taskId for polling.',
           inputSchema: {
             type: 'object',
             properties: {
               goal: { type: 'string', description: 'Engineering task or objective' },
               projectPath: { type: 'string', description: 'Working directory path (defaults to current)' },
-              modelOverride: { type: 'string', description: 'Optional model override' }
+              modelOverride: { type: 'string', description: 'Optional model override' },
+              autoApprove: { type: 'boolean', description: 'Whether to auto-apply diffs upon passing verification' }
             },
             required: ['goal']
           }
         },
         {
-          name: 'krusch_route',
-          description: 'Inspect which model specialist Krusch would select for a given prompt without executing it.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              prompt: { type: 'string', description: 'Task prompt or code snippet' }
-            },
-            required: ['prompt']
-          }
-        },
-        {
           name: 'krusch_task_status',
-          description: 'Inspect full state, turns, events, and staged diffs of a Krusch task in PostgreSQL.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              taskId: { type: 'string', description: 'Task ID' }
-            },
-            required: ['taskId']
-          }
-        },
-        {
-          name: 'krusch_explain',
-          description: 'Explain why transitions or actions are allowed or blocked for a task based on PostgreSQL invariants.',
+          description: 'Poll real-time task status, phase transitions, latest verification, and recent events from PostgreSQL.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -89,7 +75,7 @@ export async function startMcpServer() {
         },
         {
           name: 'krusch_diff',
-          description: 'View unified diff of all staged modifications for a task in PostgreSQL.',
+          description: 'Inspect unified diffs of all staged modifications held in PostgreSQL for review in KD Code.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -100,14 +86,14 @@ export async function startMcpServer() {
         },
         {
           name: 'krusch_apply_diff',
-          description: 'Approve and apply staged diffs from PostgreSQL to physical disk (guarded by verification passing and APPROVAL_GATE).',
+          description: 'Approve and apply verified staged diffs from PostgreSQL to physical disk via 2PC apply journal.',
           inputSchema: {
             type: 'object',
             properties: {
               taskId: { type: 'string', description: 'Task ID' },
-              diffId: { type: 'integer', description: 'Staged diff row ID' }
+              diffId: { type: 'integer', description: 'Optional specific diff ID; applies all verified diffs if omitted' }
             },
-            required: ['taskId', 'diffId']
+            required: ['taskId']
           }
         }
       ]
@@ -119,17 +105,39 @@ export async function startMcpServer() {
 
     try {
       if (name === 'krusch_run') {
-        const result = await stateMachine.runTask({
-          goal: args.goal,
-          projectPath: args.projectPath || process.cwd(),
-          modelOverride: args.modelOverride
-        });
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-      }
+        const taskId = `task_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        const projectPath = args.projectPath || process.cwd();
 
-      if (name === 'krusch_route') {
-        const route = router.route(args.prompt);
-        return { content: [{ type: 'text', text: JSON.stringify(route, null, 2) }] };
+        // Initialize task record synchronously so taskId is immediately valid
+        await KruschStateManager.createTask({
+          id: taskId,
+          goal: args.goal,
+          projectPath,
+          phase: 'INIT'
+        });
+
+        // Launch execution asynchronously in background (non-blocking for stdio transport)
+        stateMachine.runTask({
+          taskId,
+          goal: args.goal,
+          projectPath,
+          modelOverride: args.modelOverride,
+          autoApprove: Boolean(args.autoApprove)
+        }).catch(err => {
+          console.error(`[krusch:mcp] Background execution error for ${taskId}: ${err.message}`);
+        });
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              taskId,
+              status: 'STARTED',
+              phase: 'INIT',
+              message: 'Task successfully initialized. Poll krusch_task_status to monitor execution.'
+            }, null, 2)
+          }]
+        };
       }
 
       if (name === 'krusch_task_status') {
@@ -137,15 +145,30 @@ export async function startMcpServer() {
         if (!task) {
           throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
         }
-        return { content: [{ type: 'text', text: JSON.stringify(task, null, 2) }] };
-      }
 
-      if (name === 'krusch_explain') {
-        const explanation = await KruschStateManager.explainTaskStatus(args.taskId);
-        if (!explanation) {
-          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
-        }
-        return { content: [{ type: 'text', text: JSON.stringify(explanation, null, 2) }] };
+        // Fetch recent events for timeline
+        const eventsRes = await query(
+          'SELECT event_type, payload, created_at FROM krusch_events WHERE task_id = $1 ORDER BY id DESC LIMIT 10',
+          [args.taskId]
+        );
+
+        const statusReport = {
+          taskId: task.id,
+          goal: task.goal,
+          phase: task.phase,
+          currentModel: task.current_model,
+          turnsCount: task.turns.length,
+          stagedDiffsCount: task.stagedDiffs.length,
+          pendingDiffsCount: task.stagedDiffs.filter(d => d.status === 'PENDING').length,
+          appliedDiffsCount: task.stagedDiffs.filter(d => d.status === 'APPLIED' || d.status === 'COMMITTED').length,
+          committedDiffsCount: task.stagedDiffs.filter(d => d.status === 'COMMITTED').length,
+          latestVerification: task.verifications[0] || null,
+          isCompleted: ['COMMITTED', 'ABORTED'].includes(task.phase),
+          isWaitingApproval: task.phase === 'APPROVAL_GATE',
+          recentEvents: eventsRes.rows
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(statusReport, null, 2) }] };
       }
 
       if (name === 'krusch_diff') {
@@ -158,7 +181,8 @@ export async function startMcpServer() {
           filePath: d.file_path,
           status: d.status,
           patch: d.diff_patch,
-          sha256: d.sha256_hash
+          sha256: d.sha256_hash,
+          leaseExpiresAt: d.lease_expires_at
         }));
         return { content: [{ type: 'text', text: JSON.stringify(diffs, null, 2) }] };
       }
@@ -168,11 +192,14 @@ export async function startMcpServer() {
         if (!task) {
           throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
         }
-        const tools = new KruschTools(args.taskId, process.cwd(), {
-          policy: new KruschApprovalPolicy({ autoApprove: true })
-        });
-        const res = await tools.executeTool('apply_staged_diff', { diffId: args.diffId }, { phase: task.phase });
-        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+
+        const diffIds = args.diffId ? [args.diffId] : null;
+        const batchRes = await KruschStateManager.applyDiffBatch(args.taskId, diffIds, task.project_path || process.cwd());
+        const remainingPending = await KruschStateManager.getPendingDiffs(args.taskId);
+        if (remainingPending.length === 0) {
+          await KruschStateManager.updateTask(args.taskId, { phase: 'COMMITTED' });
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(batchRes, null, 2) }] };
       }
 
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);

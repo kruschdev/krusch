@@ -538,6 +538,54 @@ test('Transaction Protocol: applyDiffBatch strictly refuses to apply REJECTED di
   fs.rmSync(testDir, { recursive: true, force: true });
 });
 
+test('Transaction Protocol: Durable apply journal records APPLYING and APPLIED state in PostgreSQL', async () => {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-journal-test-'));
+  const taskId = `journal_${Date.now()}`;
+
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test durable apply journal table',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.APPROVAL_GATE
+  });
+
+  await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'pass',
+    stderr: '',
+    passed: true
+  });
+
+  await KruschStateManager.stageDiff(taskId, {
+    filePath: 'journaled_file.js',
+    originalContent: '// before',
+    stagedContent: '// after',
+    diffPatch: '@@ -1 +1 @@\n-// before\n+// after\n',
+    projectPath: testDir
+  });
+
+  fs.writeFileSync(path.join(testDir, 'journaled_file.js'), '// before', 'utf-8');
+
+  const applyRes = await KruschStateManager.applyDiffBatch(taskId, null, testDir);
+  assert.strictEqual(applyRes.status, 'APPLIED');
+  assert.ok(applyRes.journalId);
+
+  // Inspect journal row in PostgreSQL
+  const journalRows = await query(`SELECT * FROM krusch_apply_journal WHERE id = $1`, [applyRes.journalId]);
+  assert.strictEqual(journalRows.rows.length, 1);
+  const journal = journalRows.rows[0];
+  assert.strictEqual(journal.state, 'APPLIED');
+  assert.strictEqual(journal.task_id, taskId);
+  assert.ok(journal.completed_at);
+  const files = typeof journal.files === 'string' ? JSON.parse(journal.files) : journal.files;
+  assert.strictEqual(files[0].filePath, 'journaled_file.js');
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+  fs.rmSync(testDir, { recursive: true, force: true });
+});
+
 test.after(async () => {
   await pool.end();
 });
+

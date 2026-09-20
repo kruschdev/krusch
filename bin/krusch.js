@@ -211,6 +211,7 @@ program
   .command('status <taskId>')
   .description('Inspect task execution details, turns, staged diffs, and verification trace from PostgreSQL')
   .option('--trace', 'Print complete execution trace and invariant explanation', false)
+  .option('--export <file>', 'Export complete machine-readable execution trace to JSON file')
   .action(async (taskId, options) => {
     try {
       const task = await KruschStateManager.getTask(taskId);
@@ -229,6 +230,35 @@ program
       console.log(`  Staged Diffs:  ${task.stagedDiffs.length}`);
       console.log(`  Approvals:     ${task.approvals.length}`);
       console.log(`  Verifications: ${task.verifications.length}`);
+
+      // Query apply journal entries for this task
+      const journalRes = await query(
+        'SELECT id, state, files, created_at, completed_at, error_message FROM krusch_apply_journal WHERE task_id = $1 ORDER BY id ASC',
+        [taskId]
+      );
+      if (journalRes.rows.length > 0) {
+        console.log(chalk.bold('\n  2PC Apply Journal:'));
+        for (const j of journalRes.rows) {
+          const stateColor = j.state === 'APPLIED' ? chalk.green(j.state) : j.state === 'APPLYING' ? chalk.yellow(j.state) : chalk.red(j.state);
+          console.log(`    - Journal #${j.id} [${stateColor}] at ${new Date(j.created_at).toISOString().slice(11, 19)}`);
+        }
+      }
+
+      // Query complete event timeline
+      const eventsRes = await query(
+        'SELECT id, event_type, payload, created_at FROM krusch_events WHERE task_id = $1 ORDER BY id ASC',
+        [taskId]
+      );
+
+      console.log(chalk.bold.cyan('\n⏱️ Chronological Event Timeline:'));
+      if (eventsRes.rows.length === 0) {
+        console.log(chalk.gray('  No events recorded.'));
+      } else {
+        for (const ev of eventsRes.rows) {
+          const time = new Date(ev.created_at).toISOString().slice(11, 19);
+          console.log(`  [${chalk.gray(time)}] ${chalk.bold.magenta(ev.event_type.padEnd(20))}: ${chalk.gray(JSON.stringify(ev.payload))}`);
+        }
+      }
 
       if (options.trace) {
         const explanation = await KruschStateManager.explainTaskStatus(taskId);
@@ -269,16 +299,29 @@ program
           const prefix = isBlocked ? chalk.red('  ✗') : chalk.green('  ✓');
           console.log(`${prefix} ${chalk.bold(`${t.from} ➔ ${t.to}`)}: ${isBlocked ? chalk.red(t.reason) : chalk.gray(t.reason)}`);
         }
-
-        // Show recent events
-        const eventsRes = await query('SELECT event_type, payload, created_at FROM krusch_events WHERE task_id = $1 ORDER BY id DESC LIMIT 5', [taskId]);
-        if (eventsRes.rows.length > 0) {
-          console.log(chalk.bold('\n  Recent Structured Events:'));
-          for (const ev of eventsRes.rows) {
-            console.log(`    - [${new Date(ev.created_at).toISOString().slice(11, 19)}] ${chalk.cyan(ev.event_type)}: ${JSON.stringify(ev.payload).slice(0, 80)}`);
-          }
-        }
       }
+
+      // Handle --export <file>
+      if (options.export) {
+        const fullTrace = {
+          taskId: task.id,
+          goal: task.goal,
+          phase: task.phase,
+          currentModel: task.current_model,
+          metadata: task.metadata,
+          turns: task.turns,
+          stagedDiffs: task.stagedDiffs,
+          verifications: task.verifications,
+          approvals: task.approvals,
+          applyJournals: journalRes.rows,
+          events: eventsRes.rows,
+          exportedAt: new Date().toISOString()
+        };
+        const exportPath = path.resolve(process.cwd(), options.export);
+        fs.writeFileSync(exportPath, JSON.stringify(fullTrace, null, 2), 'utf-8');
+        console.log(chalk.bold.green(`\n✓ Full execution trace exported to: ${exportPath}`));
+      }
+
       console.log();
       process.exit(0);
     } catch (err) {

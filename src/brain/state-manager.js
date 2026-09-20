@@ -446,6 +446,7 @@ export class KruschStateManager {
           });
           recovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'APPLIED' });
         }
+        await query(`UPDATE krusch_apply_journal SET state = 'APPLIED', completed_at = NOW() WHERE task_id = $1 AND state = 'APPLYING'`, [taskId]);
       } else if (allUntouched) {
         // Case 2: No rename occurred across all files in the batch
         for (const item of inspected) {
@@ -458,6 +459,7 @@ export class KruschStateManager {
           });
           recovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'REVERTED_TO_PENDING' });
         }
+        await query(`UPDATE krusch_apply_journal SET state = 'ROLLED_BACK', completed_at = NOW() WHERE task_id = $1 AND state = 'APPLYING'`, [taskId]);
       } else {
         // Case 4: Partial batch crash! Some files were renamed, others were not.
         // Roll back already renamed files to preserve atomic multi-file apply invariant.
@@ -489,6 +491,7 @@ export class KruschStateManager {
             outcome: 'BATCH_ROLLBACK_REVERTED_TO_PENDING'
           });
         }
+        await query(`UPDATE krusch_apply_journal SET state = 'ROLLED_BACK', completed_at = NOW() WHERE task_id = $1 AND state = 'APPLYING'`, [taskId]);
       }
     }
 
@@ -586,13 +589,46 @@ export class KruschStateManager {
 
     const targetIds = targets.map(d => d.id);
 
-    // Step 3: Journal APPLYING intent in PostgreSQL
+    // Step 3: Write durable Two-Phase Commit Apply Journal in PostgreSQL
+    const journalPayload = preparedFiles.map(f => ({
+      diffId: f.diff.id,
+      filePath: f.diff.file_path,
+      stagedHash: f.diff.sha256_hash,
+      originalHash: f.diff.original_sha256,
+      fullPath: f.fullPath
+    }));
+
+    const journalRes = await query(`
+      INSERT INTO krusch_apply_journal (task_id, project_path, state, files, created_at)
+      VALUES ($1, $2, 'APPLYING', $3, NOW())
+      RETURNING id;
+    `, [taskId, baseProject, JSON.stringify(journalPayload)]);
+    const journalId = journalRes.rows[0]?.id;
+
+    // Journal APPLYING intent on staged diffs
     await query(`UPDATE krusch_staged_diffs SET status = 'APPLYING' WHERE id = ANY($1::int[])`, [targetIds]);
     for (const diff of targets) {
       await KruschStateManager.recordEvent(taskId, null, 'apply_started', {
         diffId: diff.id,
-        filePath: diff.file_path
+        filePath: diff.file_path,
+        journalId
       });
+    }
+
+    // Test hook for deterministic mid-apply crash testing before any rename (strictly test-only)
+    const allowHooks = process.env.NODE_ENV === 'test' ||
+      process.env.KRUSCH_ENABLE_TEST_HOOKS === '1' ||
+      process.env.KRUSCH_ENABLE_TEST_HOOKS === 'true' ||
+      process.env.npm_lifecycle_event === 'test';
+    if (allowHooks && process.env.KRUSCH_TEST_HOOK_PAUSE_BEFORE_RENAME) {
+      if (process.send) {
+        process.send({ readyForKill: true });
+      }
+      if (process.env.KRUSCH_TEST_HOOK_MARKER_FILE) {
+        try { fs.writeFileSync(process.env.KRUSCH_TEST_HOOK_MARKER_FILE, 'ready', 'utf-8'); } catch (_) {}
+      }
+      // Pause and await SIGKILL from parent test runner
+      await new Promise(resolve => setTimeout(resolve, 30000));
     }
 
     // Step 4: Atomic POSIX Rename for all files with complete rollback on failure
@@ -603,11 +639,12 @@ export class KruschStateManager {
         renamedSoFar.push(item);
         await KruschStateManager.recordEvent(taskId, null, 'apply_fsync', {
           diffId: item.diff.id,
-          filePath: item.diff.file_path
+          filePath: item.diff.file_path,
+          journalId
         });
 
         // Test hook for deterministic mid-apply crash testing
-        if (process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME && renamedSoFar.length === 1) {
+        if (allowHooks && process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME && renamedSoFar.length === 1) {
           if (process.send) {
             process.send({ readyForKill: true });
           }
@@ -635,27 +672,47 @@ export class KruschStateManager {
           try { fs.unlinkSync(item.tempPath); } catch (_) {}
         }
       }
+      // Mark journal as ROLLED_BACK
+      if (journalId) {
+        await query(`
+          UPDATE krusch_apply_journal
+          SET state = 'ROLLED_BACK', completed_at = NOW(), error_message = $1
+          WHERE id = $2
+        `, [renameErr.message, journalId]);
+      }
+
       // Revert DB state back to PENDING
       await query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = ANY($1::int[])`, [targetIds]);
       await KruschStateManager.recordEvent(taskId, null, 'apply_failed', {
         error: renameErr.message,
-        targetIds
+        targetIds,
+        journalId
       });
       throw new Error(`MULTI_FILE_APPLY_FAILED: ${renameErr.message}`);
     }
 
-    // Step 5: Mark all rows as APPLIED in PostgreSQL
+    // Step 5: Mark all rows as APPLIED in PostgreSQL and complete journal
     await query(`UPDATE krusch_staged_diffs SET status = 'APPLIED', applied_at = NOW() WHERE id = ANY($1::int[])`, [targetIds]);
+    if (journalId) {
+      await query(`
+        UPDATE krusch_apply_journal
+        SET state = 'APPLIED', completed_at = NOW()
+        WHERE id = $1
+      `, [journalId]);
+    }
+
     for (const diff of targets) {
       await KruschStateManager.recordEvent(taskId, null, 'apply_completed', {
         diffId: diff.id,
-        filePath: diff.file_path
+        filePath: diff.file_path,
+        journalId
       });
     }
 
     return {
       status: 'APPLIED',
       appliedCount: targets.length,
+      journalId,
       diffs: targets.map(d => ({ id: d.id, filePath: d.file_path }))
     };
   }

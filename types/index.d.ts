@@ -344,4 +344,60 @@ export class KruschContextClient {
   static recordMemory(params: { projectPath?: string; category?: string; content: string; tags?: string[]; taskId?: string | null }): Promise<any>;
 }
 
+export interface ApplyJournalRecord {
+  id: number;
+  task_id: string;
+  project_path: string;
+  state: 'APPLYING' | 'APPLIED' | 'ROLLED_BACK' | 'FAILED';
+  files: Array<{
+    diffId: number;
+    filePath: string;
+    stagedHash: string;
+    originalHash: string | null;
+    fullPath: string;
+  }>;
+  error_message?: string | null;
+  created_at: string;
+  completed_at?: string | null;
+}
+
+export class KruschVerificationContract {
+  static loadContract(projectPath?: string): any | null;
+  static checkPathContracts(contract: any, stagedDiffs?: any[]): { valid: boolean; error?: string };
+  static runInStagedTree(projectPath: string, stagedDiffs: any[], options?: any): Promise<{
+    command: string;
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    passed: boolean;
+    durationMs: number;
+    extractedErrors?: any[];
+    stagedTreeExecuted?: boolean;
+  }>;
+  static copyTree(src: string, dest: string, options?: any): void;
+}
+
+export function classifyPrompt(prompt: string): {
+  isFastPath: boolean;
+  role?: string;
+  ruleId?: string;
+  confidence?: string;
+};
+
+export class DefaultKruschRouter {
+  specialists: Record<string, string>;
+  escalationPolicy: Record<string, any>;
+  constructor(options?: any);
+  route(prompt: string, context?: any): {
+    modelId: string;
+    stage: string;
+    confidence: string;
+    role: string;
+    ruleId: string | null;
+    latencyMs: number;
+    costEstimate: string;
+    rationale: string;
+  };
+}
+
 export function startMcpServer(): Promise<void>;

@@ -80,6 +80,8 @@ test('Real Crash Smoke: kill -9 mid-apply on multi-file batch, reboot recovery, 
     stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
     env: {
       ...process.env,
+      NODE_ENV: 'test',
+      KRUSCH_ENABLE_TEST_HOOKS: '1',
       KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME: '1',
       KRUSCH_TEST_HOOK_MARKER_FILE: markerFile
     }

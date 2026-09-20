@@ -54,6 +54,17 @@
 - `src/router/`: Cascade router integrating `krusch-pre-router` and `krusch-cascade-router`.
 - `src/models/`: Normalized model adapters (OpenRouter, Anthropic, Gemini, Ollama, Mock).
 - `src/workflow/`: `KruschStateMachine`, `KruschTrajectoryGuard`, `KruschFailureClassifier` (`KruschModularRSI`).
-- `src/verify/`: Ground-truth test runner and diff guards.
+- `src/verify/`: Ground-truth test runner, verification contracts (`krusch.verify.json`), and staged-tree sandboxing.
 - `src/approvals/`: Human-in-the-loop and automated approval policies.
-- `src/server/`: Model Context Protocol (MCP) stdio server.
+- `src/server/`: Model Context Protocol (MCP) stdio server (thin 4-tool async interface).
+
+---
+
+## 🚫 Non-Goals & "Do Not Implement" Guidelines
+
+To preserve harness reliability and eliminate architectural bloat:
+1. **Do NOT build IDE or GUI components**: Krusch is a headless execution engine. KD Code is the IDE control plane. Communication occurs exclusively via the thin 4-tool MCP server (`./bin/krusch.js mcp`) or CLI.
+2. **Do NOT add external routers or pin unpublished sibling repositories**: Routing is decoupled behind `src/router/interface.js`. The in-repo regex + mock gate runs out of the box with zero external git dependencies. External routers are optional pluggable adapters.
+3. **Do NOT bypass PostgreSQL staging**: Never write or mutate files on physical disk directly from tools or model adapters. All mutations must pass through `stage_diff -> VERIFY (staged tree) -> APPROVAL_GATE -> 2PC Apply Journal`.
+4. **Do NOT allow model shell execution during IMPLEMENT**: Shell commands (`run_command`) are strictly forbidden during `PLAN` and `IMPLEMENT` phases to prevent unverified out-of-band disk mutations.
+

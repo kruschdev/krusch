@@ -16,17 +16,31 @@
 
 ---
 
-## The Problem & The Contract
+## What You Need to Know
 
-Most AI coding agents write modifications directly to your working tree on physical disk, hoping the generated code compiles. When an LLM produces a broken patch, hallucinates an import, times out, or hits a rate limit halfway through a multi-file refactor, your repository is left in a dirty, broken state.
+### 1. What happens to my files?
+Your physical working tree is **never touched** while models plan, edit, or test:
+- **Diffs are Staged into PostgreSQL**: Model modifications are SHA-256 hashed and held in `krusch_staged_diffs`. Physical files on disk remain untouched.
+- **Verification Runs in a Staged Sandbox**: Ground-truth tests execute against an isolated staged-tree sandbox (`krusch.verify.json`) containing the proposed modifications.
+- **2PC Apply Journal**: Only after tests pass and approval is granted does Krusch apply changes to disk using a two-phase commit journal (`krusch_apply_journal` + temp file + `fsync` + atomic rename). If working tree drift is detected, write is refused.
 
-`krusch` treats file mutation as a real database transaction:
+### 2. How do I resume after a timeout or crash?
+PostgreSQL is the brain; models are ephemeral compute:
+- Task state, turns, events, and diffs persist in PostgreSQL, not process memory.
+- On reboot, `krusch init` or any harness command runs startup crash recovery: incomplete apply operations are replayed or rolled back atomically to base preimages.
+- Run `./bin/krusch.js status <taskId> --trace` to inspect the full chronological timeline, or export a machine-readable trace via `--export <file>`.
 
-1. **Diffs are Staged in PostgreSQL First**: Model-generated patches are SHA-256 hashed and inserted into `krusch_staged_diffs`. Physical files on disk are never touched during planning or drafting.
-2. **Ground-Truth Tests Must Pass**: Transition to `APPROVAL_GATE` is strictly rejected by database triggers unless automated test commands execute and pass with `exit_code: 0`.
-3. **Working Tree Drift Protection**: Before writing to disk, `krusch` verifies that the target file on disk matches the base hash recorded at staging time. If an external process or editor modified the file in the background, apply is refused.
-4. **Crash-Safe Two-Phase Apply**: When applying diffs, `krusch` journals intent (`APPLYING`), flushes content to a temporary sibling file with `fsync`, atomically renames it over the target, and marks it `APPLIED`. If the process crashes mid-apply, startup recovery verifies disk hashes and finishes or reverts the row automatically.
-5. **Single-Writer File Leases with TTL**: Tasks acquire exclusive leases on modified files. A configurable lease TTL (default 15 minutes) ensures that abandoned or crashed tasks cannot hold locks indefinitely.
+### 3. How do I approve a patch?
+- **CLI**: Inspect unified diffs with `./bin/krusch.js diff <taskId>` and approve interactively or via `--auto-approve`.
+- **KD Code / IDE**: KD Code connects via the thin MCP server (`./bin/krusch.js mcp`). When Krusch reaches `APPROVAL_GATE`, KD Code displays the patch in its native diff viewer (`@pierre/diffs`), and clicking "Approve" triggers `krusch_apply_diff`.
+
+---
+
+## 🚫 Non-Goals
+
+- **Not an IDE**: Krusch is a headless execution engine. KD Code provides the developer workbench, diff inspector, and approval surface.
+- **Not a Memory Store**: Krusch is an execution and staging harness, not a long-term personal memory agent.
+- **Not an Agent OS**: Krusch does not manage multi-tenant permissions or browser windows. It stages diffs, runs tests, and applies verified code to disk.
 
 ---
 
@@ -145,19 +159,17 @@ krusch migrate
 
 ## Model Context Protocol (MCP) Server
 
-`krusch` exposes an MCP server over stdio for IDE integration (Claude Code, Cursor, Antigravity, or custom agents):
+`krusch` provides a Model Context Protocol (MCP) server over stdio for IDE integration (including KD Code):
 
 ```bash
-krusch mcp
+./bin/krusch.js mcp
 ```
 
-### Available MCP Tools:
-- **`krusch_run`**: Execute an engineering task through the harness.
-- **`krusch_route`**: Inspect model selection and cost estimates for a prompt without executing it.
-- **`krusch_task_status`**: Inspect full database state, turns, and staged diffs.
-- **`krusch_explain`**: Explain current task blockers and invariant checks.
-- **`krusch_diff`**: Retrieve unified diffs of staged modifications.
-- **`krusch_apply_diff`**: Apply verified staged diffs to disk (strictly guarded by `APPROVAL_GATE` and test passing).
+Exposes four core async tools:
+- **`krusch_run`**: Asynchronously launch an engineering task in PostgreSQL; returns immediately with `taskId` for non-blocking execution.
+- **`krusch_task_status`**: Poll real-time task status, phase transitions, verification records, and recent event timeline.
+- **`krusch_diff`**: Retrieve unified diffs of staged modifications held in PostgreSQL for review in KD Code.
+- **`krusch_apply_diff`**: Approve and apply verified staged diffs to disk via 2PC apply journal (strictly guarded by `APPROVAL_GATE` and test passing).
 
 ---
 
