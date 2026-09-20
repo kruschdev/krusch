@@ -28,11 +28,17 @@
 ## 🛠️ Key Commands
 
 - `npm test`: Run full test suite (unit + PostgreSQL integration).
-- `npm run test:unit`: Fast unit tests (router, normalizer, trajectory guard, modular-rsi).
-- `npm run test:integration`: PostgreSQL lifecycle integration tests.
-- `npm run migrate`: Apply versioned migrations from `db/migrations/` to PostgreSQL (`kdcode`).
-- `./bin/krusch.js run "<goal>"`: Run CLI harness.
-- `./bin/krusch.js route "<prompt>"`: Test cascade routing decision.
+- `npm run test:unit`: Fast unit tests (router, normalizer, trajectory guard, modular-rsi, golden set).
+- `npm run test:integration`: PostgreSQL lifecycle, two-phase apply transaction, crash recovery, and enforcement tests.
+- `npm run typecheck`: Verify TypeScript declarations (`tsc --noEmit`).
+- `npm run migrate`: Apply versioned migrations from `db/migrations/` to PostgreSQL.
+- `./bin/krusch.js init`: Bootstrap `.env`, probe PostgreSQL connectivity, and run migrations.
+- `./bin/krusch.js run "<goal>" [--mock]`: Run CLI harness.
+- `./bin/krusch.js status <taskId> [--trace]`: Deep execution trace with invariant blocker diagnostics.
+- `./bin/krusch.js explain <taskId>`: Explain why transitions or actions are allowed or blocked.
+- `./bin/krusch.js diff <taskId> [--export <file>]`: Unified diff inspector and patch exporter.
+- `./bin/krusch.js lease [list|unlock|prune]`: File concurrency lease inspection and pruning.
+- `./bin/krusch.js route "<prompt>"`: Test cascade routing decision with cost estimate.
 - `./bin/krusch.js mcp`: Run stdio MCP server.
 
 ---

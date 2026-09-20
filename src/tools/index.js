@@ -11,17 +11,21 @@ export class KruschTools {
     this.taskId = taskId;
     this.projectPath = projectPath;
     this.policy = options.policy || new KruschApprovalPolicy(options);
+    this.verificationCommand = options.verificationCommand || null;
   }
 
   getDefinitions() {
     return [
       {
         name: 'read_file',
-        description: 'Read the text content of a file from the repository.',
+        description: 'Read the token-bounded text content of a file from the repository with line citations.',
         parameters: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'Relative path to file' }
+            path: { type: 'string', description: 'Relative path to file' },
+            startLine: { type: 'integer', description: 'Starting line number (1-indexed, default 1)' },
+            endLine: { type: 'integer', description: 'Ending line number (inclusive)' },
+            maxLines: { type: 'integer', description: 'Maximum lines to return (default 200, max 500)' }
           },
           required: ['path']
         }
@@ -52,7 +56,7 @@ export class KruschTools {
       },
       {
         name: 'run_command',
-        description: 'Execute a test, build, or verification command.',
+        description: `Execute a test, build, or verification command.${this.verificationCommand ? ` Target project test command: "${this.verificationCommand}".` : ''}`,
         parameters: {
           type: 'object',
           properties: {
@@ -99,11 +103,41 @@ export class KruschTools {
       if (!fs.existsSync(fullPath)) {
         return { error: `File not found: ${args.path}` };
       }
-      const content = fs.readFileSync(fullPath, 'utf-8');
-      return { path: filePath, content };
+      const rawContent = fs.readFileSync(fullPath, 'utf-8');
+      const lines = rawContent.split('\n');
+      const totalLines = lines.length;
+
+      const startLine = Math.max(1, parseInt(args.startLine || args.start_line || 1, 10));
+      const maxLines = Math.min(parseInt(args.maxLines || args.max_lines || 200, 10), 500);
+      const endLine = args.endLine || args.end_line
+        ? Math.min(parseInt(args.endLine || args.end_line, 10), totalLines)
+        : Math.min(startLine + maxLines - 1, totalLines);
+
+      const slice = lines.slice(startLine - 1, endLine);
+      const numberedContent = slice.map((line, idx) => `${startLine + idx} | ${line}`).join('\n');
+
+      return {
+        path: filePath,
+        startLine,
+        endLine,
+        totalLines,
+        isTruncated: endLine < totalLines,
+        citation: `${filePath}:${startLine}-${endLine}`,
+        content: numberedContent
+      };
     }
 
     if (name === 'stage_diff') {
+      if (!args.path || typeof args.path !== 'string') {
+        return { error: 'Invalid path: file path must be a non-empty string.' };
+      }
+      if (args.content === undefined || args.content === null || typeof args.content !== 'string') {
+        return { error: 'Invalid content: staged content must be a valid string.' };
+      }
+      if (args.content.includes('\0')) {
+        return { error: 'Invalid content: binary null bytes detected in staged text content.' };
+      }
+
       const { projectPath, filePath } = canonicalizePaths(this.projectPath, args.path);
       const fullPath = path.resolve(projectPath, filePath);
       const originalContent = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
@@ -119,104 +153,47 @@ export class KruschTools {
         diffId: stagedRow.id,
         filePath: stagedRow.file_path,
         hash: stagedRow.sha256_hash,
+        leaseExpiresAt: stagedRow.lease_expires_at,
         message: `Changes staged in PostgreSQL (ID: ${stagedRow.id}). Ready for verification.`
       };
     }
 
     if (name === 'search_symbols') {
+      if (!args.query || typeof args.query !== 'string') {
+        return { error: 'Invalid query: search query must be a non-empty string.' };
+      }
       const symbols = await KruschContextClient.searchCodeSymbols(args.query, 10);
       return { query: args.query, results: symbols };
     }
 
     if (name === 'run_command') {
+      if (!args.command || typeof args.command !== 'string') {
+        return { error: 'Invalid command: command must be a non-empty string.' };
+      }
       const result = await KruschTestRunner.runCommand(args.command, this.projectPath);
       await KruschStateManager.recordVerificationRun(this.taskId, {
         command: args.command,
         exitCode: result.exitCode,
         stdout: result.stdout,
         stderr: result.stderr,
-        passed: result.passed
+        passed: result.passed,
+        extractedErrors: result.extractedErrors || []
       });
       return result;
     }
 
     if (name === 'apply_staged_diff') {
-      const task = await KruschStateManager.getTask(this.taskId);
-      if (!task) {
-        return { error: `Task ${this.taskId} not found.` };
+      if (!args.diffId || typeof args.diffId !== 'number') {
+        return { error: 'Invalid diffId: diffId must be an integer.' };
       }
-
-      // Hard Invariant Guard: Phase must be APPROVAL_GATE
-      if (task.phase !== 'APPROVAL_GATE') {
-        return {
-          error: 'MUTATION_BLOCKED_INVALID_PHASE',
-          message: `Cannot apply staged diff to disk while task is in '${task.phase}' phase. Task must pass verification and enter 'APPROVAL_GATE'.`
-        };
-      }
-
-      // Hard Invariant Guard: Ground-truth tests must have passed on true latest run
-      const latestVerif = await KruschStateManager.getLatestVerificationRun(this.taskId);
-      if (latestVerif && (!latestVerif.passed || latestVerif.exit_code !== 0)) {
-        return {
-          error: 'VERIFICATION_FAILED_MUTATION_BLOCKED',
-          message: `Refusing to apply staged diff to disk: ground-truth verification is failing (Exit Code: ${latestVerif.exit_code}).`
-        };
-      }
-
-      const diffs = await KruschStateManager.getPendingDiffs(this.taskId);
-      const target = diffs.find(d => d.id === args.diffId);
-      if (!target) {
-        return { error: `Pending diff with ID ${args.diffId} not found.` };
-      }
-
-      const { projectPath, filePath } = canonicalizePaths(this.projectPath, target.file_path);
-      const fullPath = path.resolve(projectPath, filePath);
-      const targetDir = path.dirname(fullPath);
-      fs.mkdirSync(targetDir, { recursive: true });
-
-      // Hard Invariant Guard: Working Tree Drift Detection
-      // Ensure file on disk has not been modified out-of-band since diff was staged
-      const diskFileExists = fs.existsSync(fullPath);
-      const currentDiskContent = diskFileExists ? fs.readFileSync(fullPath, 'utf-8') : null;
-      const currentDiskHash = (currentDiskContent !== null && currentDiskContent !== '')
-        ? crypto.createHash('sha256').update(currentDiskContent).digest('hex')
-        : null;
-
-      const expectedOriginalHash = target.original_sha256 || (
-        (target.original_content !== null && target.original_content !== undefined && target.original_content !== '')
-          ? crypto.createHash('sha256').update(target.original_content).digest('hex')
-          : null
-      );
-
-      if (currentDiskHash !== expectedOriginalHash) {
-        return {
-          error: 'WORKING_TREE_DRIFT_DETECTED',
-          message: `Refusing to apply staged diff to disk: working tree file '${target.file_path}' was modified after diff was staged. Expected base hash: ${expectedOriginalHash || 'none'}, current disk hash: ${currentDiskHash || 'none'}. Staged diff must be rebased and re-verified.`
-        };
-      }
-
-      // Crash-Safe Atomic Apply:
-      // 1. Write staged content to sibling temporary file
-      // 2. fsync to force physical flush to storage media
-      // 3. Atomic rename replaces destination file atomically on POSIX filesystems
-      // 4. Update PostgreSQL status to APPLIED with timestamp
-      const randSuffix = crypto.randomBytes(4).toString('hex');
-      const tempPath = path.resolve(targetDir, `.${path.basename(fullPath)}.krusch-tmp-${Date.now()}-${randSuffix}`);
-
       try {
-        const fd = fs.openSync(tempPath, 'w');
-        fs.writeSync(fd, target.staged_content);
-        fs.fsyncSync(fd);
-        fs.closeSync(fd);
-
-        fs.renameSync(tempPath, fullPath);
-        await KruschStateManager.updateDiffStatus(target.id, 'APPLIED');
-        return { status: 'APPLIED', diffId: target.id, filePath: target.file_path };
-      } catch (err) {
-        if (fs.existsSync(tempPath)) {
-          try { fs.unlinkSync(tempPath); } catch (_) {}
+        const batchResult = await KruschStateManager.applyDiffBatch(this.taskId, [args.diffId], this.projectPath);
+        if (batchResult.status === 'APPLIED') {
+          return { status: 'APPLIED', diffId: args.diffId, filePath: batchResult.diffs[0]?.filePath };
         }
-        return { error: `CRASH_SAFE_APPLY_FAILED: ${err.message}` };
+        return batchResult;
+      } catch (err) {
+        return { error: err.code || 'CRASH_SAFE_APPLY_FAILED', message: err.message };
       }
     }
 

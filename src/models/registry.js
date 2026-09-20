@@ -6,7 +6,7 @@ export class ModelRegistry {
   constructor(options = {}) {
     this.options = options;
     this.adapters = new Map();
-    this.mockAdapter = options.mockAdapter || new MockModelAdapter();
+    this.mockAdapter = options.mockAdapter || new MockModelAdapter({ simulateTrajectory: options.simulateMockTrajectory });
   }
 
   getAdapter(modelId) {

@@ -4,7 +4,7 @@ import { KruschCascadeRouter } from '../router/cascade.js';
 import { ModelRegistry } from '../models/registry.js';
 import { KruschTools } from '../tools/index.js';
 import { KruschTrajectoryGuard } from './trajectory-guard.js';
-import { KruschModularRSI } from './modular-rsi.js';
+import { KruschModularRSI, RSI_ACTION_TYPES } from './modular-rsi.js';
 import { KruschApprovalPolicy } from '../approvals/policy.js';
 import { KruschFSM, HARNESS_PHASES } from './fsm.js';
 
@@ -20,19 +20,39 @@ export class KruschStateMachine {
   /**
    * Run a goal through the complete invariant coding harness lifecycle.
    */
-  async runTask({ goal, projectPath = process.cwd(), maxTurns = 10, modelOverride = null }) {
+  async runTask({ goal, projectPath = process.cwd(), maxTurns = 10, modelOverride = null, verificationCommand = null }) {
+    // 0. Startup Crash Recovery & Lease Maintenance: inspect and resolve in-flight applies, and prune expired leases
+    const recovered = await KruschStateManager.recoverInFlightApplies(projectPath);
+    if (recovered.length > 0) {
+      console.log(`[krusch] Recovered ${recovered.length} in-flight diff apply operation(s) from prior session.`);
+    }
+    const pruned = await KruschStateManager.pruneExpiredLeases();
+    if (pruned.length > 0) {
+      console.log(`[krusch] Pruned ${pruned.length} expired file concurrency lease(s).`);
+    }
+
+    const pinnedModel = modelOverride || this.options.pinnedModel || null;
+
     // 1. Initialize Task in PostgreSQL Cognitive Substrate
     const task = await KruschStateManager.createTask({
       goal,
       projectPath,
       phase: HARNESS_PHASES.INIT,
-      metadata: { initiatedBy: 'krusch-harness', createdAt: new Date().toISOString() }
+      verificationCommand,
+      metadata: {
+        initiatedBy: 'krusch-harness',
+        pinnedModel,
+        createdAt: new Date().toISOString()
+      }
     });
 
     const fsm = new KruschFSM(task.id, HARNESS_PHASES.INIT);
     console.log(`[krusch] Initialized task ${task.id} in PostgreSQL (Phase: ${fsm.currentPhase})`);
 
-    const tools = new KruschTools(task.id, projectPath, { policy: this.policy });
+    const tools = new KruschTools(task.id, projectPath, {
+      policy: this.policy,
+      verificationCommand: task.verification_command
+    });
     const toolDefs = tools.getDefinitions();
 
     // 2. Assemble Grounded Context from AST & Memory
@@ -43,12 +63,23 @@ export class KruschStateMachine {
     await fsm.transitionTo(HARNESS_PHASES.PLAN);
 
     // 3. Select Initial Model via Cascade Router
-    let route = modelOverride
-      ? { modelId: modelOverride, stage: 'MANUAL', role: 'custom', rationale: 'User manual model override' }
-      : this.router.route(goal, { priorFailureCount: 0 });
+    let route = this.router.route(goal, {
+      pinnedModel,
+      priorFailureCount: 0
+    });
 
-    console.log(`[krusch] Routing: selected [${route.modelId}] via [${route.stage}] (${route.rationale})`);
+    console.log(`[krusch] Routing: selected [${route.modelId}] via [${route.stage}] (Est: ${route.costEstimate}, Latency: ${route.latencyMs}ms)`);
     await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
+
+    // Record routing event in PostgreSQL
+    await KruschStateManager.recordEvent(task.id, null, 'routing_decision', {
+      stage: route.stage,
+      modelId: route.modelId,
+      latencyMs: route.latencyMs,
+      costEstimate: route.costEstimate,
+      ruleId: route.ruleId,
+      rationale: route.rationale
+    });
 
     // 4. Invariant Prompt Template with Token-Budgeted Context
     const systemPrompt = `You are an engineering coding agent running within the Krusch harness.
@@ -57,10 +88,10 @@ Your goal: "${goal}"
 ${contextPromptBlock}
 
 Operating Workflow Rules:
-1. Always explore and read relevant files before modifying.
-2. Use 'stage_diff' to propose modifications into PostgreSQL.
+1. Always explore and read relevant files before modifying (use token-bounded 'read_file').
+2. Use 'stage_diff' to propose modifications into PostgreSQL ACID storage.
 3. Use 'run_command' to run existing tests or verify syntax.
-4. Changes can only be applied to disk once ground-truth verification passes.`;
+4. Changes can only be applied to physical disk once ground-truth verification passes.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -70,6 +101,7 @@ Operating Workflow Rules:
     const turnHistory = [];
     let consecutiveTestFailures = 0;
     let latestTestPassed = false;
+    let latestFailureClass = null;
 
     for (let turnNum = 1; turnNum <= maxTurns; turnNum++) {
       console.log(`[krusch] ─── Turn ${turnNum}/${maxTurns} [Phase: ${fsm.currentPhase} | Model: ${route.modelId}] ───`);
@@ -79,7 +111,12 @@ Operating Workflow Rules:
       if (!trajectoryStatus.healthy) {
         console.warn(`[krusch] Trajectory Guard triggered: ${trajectoryStatus.reason}`);
         if (trajectoryStatus.action === 'ESCALATE_TO_FRONTIER') {
-          route = this.router.route(goal, { priorFailureCount: 2, requireFrontier: true });
+          route = this.router.route(goal, {
+            pinnedModel,
+            priorFailureCount: 2,
+            requireFrontier: true,
+            forceEscalate: true
+          });
           console.log(`[krusch] Escalating turn to frontier model: ${route.modelId}`);
           await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
         } else {
@@ -133,7 +170,7 @@ Operating Workflow Rules:
       // Execute Tool Invocations
       for (const toolCall of turnResult.toolCalls) {
         // FSM Transition on Action
-        if (toolCall.name === 'stage_diff' && fsm.currentPhase === HARNESS_PHASES.PLAN) {
+        if (toolCall.name === 'stage_diff' && (fsm.currentPhase === HARNESS_PHASES.PLAN || fsm.currentPhase === HARNESS_PHASES.VERIFY)) {
           await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
         } else if (toolCall.name === 'run_command') {
           if (fsm.currentPhase === HARNESS_PHASES.PLAN || fsm.currentPhase === HARNESS_PHASES.IMPLEMENT) {
@@ -156,12 +193,41 @@ Operating Workflow Rules:
           if (!result.passed) {
             consecutiveTestFailures++;
             const failureAttribution = KruschModularRSI.attributeFailure(result);
+            latestFailureClass = failureAttribution.module;
             console.warn(`[krusch:rsi] Verification Failure attributed to [${failureAttribution.module}]: ${failureAttribution.diagnosis}`);
+
+            // Actionable ModularRSI Remediations:
+            if (failureAttribution.actionType === RSI_ACTION_TYPES.REFETCH_SYMBOLS && failureAttribution.missingSymbol) {
+              const matchedSymbols = await KruschContextClient.searchCodeSymbols(failureAttribution.missingSymbol, 5);
+              const symbolPrompt = matchedSymbols.length > 0
+                ? KruschContextClient.formatSymbols(matchedSymbols)
+                : `Symbol '${failureAttribution.missingSymbol}' not found in AST index. Ensure correct imports and package dependencies.`;
+              messages.push({
+                role: 'system',
+                content: `[KruschModularRSI Context Remediation]: The test failed due to an unresolved import/symbol: "${failureAttribution.missingSymbol}". Available symbols:\n${symbolPrompt}`
+              });
+            } else if (failureAttribution.actionType === RSI_ACTION_TYPES.FORMAT_ASSERTION_DIFF) {
+              messages.push({
+                role: 'system',
+                content: `[KruschModularRSI Assertion Remediation]: Ground-truth verification assertions failed. Invariant rule: Staged code modifications must satisfy assertions without regressing existing behavior.\nDiagnosis: ${failureAttribution.diagnosis}\nRemediation: ${failureAttribution.remediation}`
+              });
+            } else if (failureAttribution.actionType === RSI_ACTION_TYPES.SWITCH_TOOL_NORMALIZER) {
+              messages.push({
+                role: 'system',
+                content: `[KruschModularRSI ToolUse Remediation]: Syntactic or parameter formatting error detected. Ensure exact parameter schema compliance and valid JavaScript/TypeScript syntax before re-staging.`
+              });
+            }
 
             // Escalate model if multiple consecutive verification failures occur
             if (consecutiveTestFailures >= 2 && route.stage !== 'FRONTIER_ESCALATION') {
-              route = this.router.route(goal, { priorFailureCount: consecutiveTestFailures, requireFrontier: true });
-              console.log(`[krusch] Escalating to [${route.modelId}] due to verification failures.`);
+              route = this.router.route(goal, {
+                pinnedModel,
+                priorFailureCount: consecutiveTestFailures,
+                failureClass: latestFailureClass,
+                requireFrontier: true,
+                forceEscalate: true
+              });
+              console.log(`[krusch] Escalating to [${route.modelId}] due to repeated verification failures.`);
               await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
             }
 
@@ -176,6 +242,7 @@ Operating Workflow Rules:
             continue;
           } else {
             consecutiveTestFailures = 0;
+            latestFailureClass = null;
           }
         }
 
@@ -189,20 +256,22 @@ Operating Workflow Rules:
 
     // Check for pending staged diffs and finalize FSM phase
     const pendingDiffs = await KruschStateManager.getPendingDiffs(task.id);
+    const allDiffs = await KruschStateManager.getStagedDiffs(task.id);
+    const hasRejected = allDiffs.some(d => d.status === 'REJECTED');
 
-    if (pendingDiffs.length > 0) {
+    if (hasRejected) {
+      console.warn(`[krusch] Task contains REJECTED staged diff(s). Preserving working tree; modifications must be re-staged and re-verified.`);
+    } else if (pendingDiffs.length > 0) {
       if (latestTestPassed && fsm.currentPhase === HARNESS_PHASES.VERIFY) {
         // Safe to enter APPROVAL_GATE
         await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
         console.log(`[krusch] Verification PASSED. Task entered APPROVAL_GATE with ${pendingDiffs.length} staged diff(s).`);
 
-        // If auto-approve policy active, apply diffs to disk and transition to COMMITTED
+        // If auto-approve policy active, apply all diffs to disk as an atomic batch unit
         if (this.policy.autoApprove) {
-          for (const diff of pendingDiffs) {
-            await tools.executeTool('apply_staged_diff', { diffId: diff.id });
-          }
+          const batchResult = await KruschStateManager.applyDiffBatch(task.id, null, projectPath);
           await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
-          console.log(`[krusch] Auto-applied ${pendingDiffs.length} staged diff(s) to physical disk.`);
+          console.log(`[krusch] Auto-applied ${batchResult.appliedCount} staged diff(s) to physical disk.`);
         }
       } else if (!latestTestPassed && fsm.currentPhase === HARNESS_PHASES.VERIFY) {
         console.warn(`[krusch] Verification FAILED. Diffs remain staged in PostgreSQL; disk mutation strictly blocked.`);

@@ -44,7 +44,13 @@ WHERE d.task_id = t.id AND t.phase = 'COMMITTED' AND d.status = 'APPLIED';
 UPDATE krusch_staged_diffs d
 SET status = 'REJECTED'
 FROM krusch_tasks t
-WHERE d.task_id = t.id AND t.phase IN ('ABORTED', 'INIT', 'PLAN', 'IMPLEMENT', 'VERIFY') AND d.status IN ('PENDING', 'APPLIED');
+WHERE d.task_id = t.id AND t.phase = 'ABORTED' AND d.status IN ('PENDING', 'APPLIED');
+
+-- Reject orphan diffs with no existing parent task
+UPDATE krusch_staged_diffs d
+SET status = 'REJECTED'
+WHERE d.status IN ('PENDING', 'APPLIED')
+  AND NOT EXISTS (SELECT 1 FROM krusch_tasks t WHERE t.id = d.task_id);
 
 -- Check for any conflicting active diffs among remaining in-flight tasks; fail loudly if conflicts found
 DO $$

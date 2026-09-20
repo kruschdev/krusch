@@ -1,0 +1,197 @@
+import test from 'node:test';
+import assert from 'node:assert';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { query, pool } from '../../src/brain/pool.js';
+import { KruschStateManager } from '../../src/brain/state-manager.js';
+import { KruschStateMachine } from '../../src/workflow/state-machine.js';
+import { MockModelAdapter } from '../../src/models/providers/mock.js';
+import { HARNESS_PHASES } from '../../src/workflow/fsm.js';
+import { KruschTestRunner } from '../../src/verify/test-runner.js';
+
+test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail tests -> restage -> pass -> apply -> commit)', async () => {
+  // 1. Create real project workspace with deliberate initial bug
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-e2e-repo-'));
+  const srcDir = path.join(testDir, 'src');
+  const testSubDir = path.join(testDir, 'test');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.mkdirSync(testSubDir, { recursive: true });
+
+  const initialBuggyCode = `export function add(a, b) {\n  return a - b; // buggy initial implementation\n}\n`;
+  const flawedStagedCode = `export function add(a, b) {\n  return a * b; // flawed first attempt\n}\n`;
+  const correctStagedCode = `export function add(a, b) {\n  return a + b; // correct fix\n}\n`;
+
+  const calcFile = path.join(srcDir, 'calculator.js');
+  fs.writeFileSync(calcFile, initialBuggyCode, 'utf-8');
+
+  // Package manifest for ESM import resolution
+  fs.writeFileSync(
+    path.join(testDir, 'package.json'),
+    JSON.stringify({ name: 'e2e-calc', type: 'module' }, null, 2),
+    'utf-8'
+  );
+
+  // Ground truth test script in workspace
+  const testScript = path.join(testSubDir, 'calculator.test.js');
+  fs.writeFileSync(
+    testScript,
+    `import assert from 'node:assert';\nimport { add } from '../src/calculator.js';\nassert.strictEqual(add(2, 3), 5, 'add(2, 3) must equal 5');\nconsole.log('Calculator test passed!');\n`,
+    'utf-8'
+  );
+
+  // 2. Program deterministic MockModelAdapter for the end-to-end trajectory:
+  // Turn 1: Model proposes flawed stage_diff and runs failing verification command
+  // Turn 2: Model restages correct fix and runs passing verification command
+  const mock = new MockModelAdapter();
+
+  // Turn 1 response: Flawed fix + failing verification
+  mock.setNextResponse({
+    text: 'Attempting initial fix and running verification suite.',
+    toolCalls: [
+      {
+        id: 'call_turn1_stage',
+        name: 'stage_diff',
+        args: {
+          path: 'src/calculator.js',
+          content: flawedStagedCode,
+          explanation: 'Initial fix attempt'
+        }
+      },
+      {
+        id: 'call_turn1_verify',
+        name: 'run_command',
+        args: {
+          command: 'node -e "console.error(\'AssertionError: Expected 5 but got 6\'); process.exit(1);"'
+        }
+      }
+    ],
+    usage: { total_tokens: 120, prompt_tokens: 80, completion_tokens: 40 },
+    latencyMs: 15
+  });
+
+  // Turn 2 response: Correct fix + passing verification
+  mock.setNextResponse({
+    text: 'Test failed with AssertionError. Restaging correct logic and running verification again.',
+    toolCalls: [
+      {
+        id: 'call_turn2_stage',
+        name: 'stage_diff',
+        args: {
+          path: 'src/calculator.js',
+          content: correctStagedCode,
+          explanation: 'Restaged correct addition logic'
+        }
+      },
+      {
+        id: 'call_turn2_verify',
+        name: 'run_command',
+        args: {
+          command: 'node -e "console.log(\'Verification passed: add(2, 3) === 5\'); process.exit(0);"'
+        }
+      }
+    ],
+    usage: { total_tokens: 140, prompt_tokens: 90, completion_tokens: 50 },
+    latencyMs: 12
+  });
+
+  // 3. Execute KruschStateMachine harness
+  const harness = new KruschStateMachine({
+    autoApprove: true,
+    useMock: true,
+    mockAdapter: mock
+  });
+
+  const result = await harness.runTask({
+    goal: 'Fix add function in src/calculator.js and verify test suite',
+    projectPath: testDir,
+    maxTurns: 3
+  });
+
+  // 4. Assert Harness Execution Result
+  assert.strictEqual(result.status, HARNESS_PHASES.COMMITTED, 'Task must reach COMMITTED state');
+  assert.strictEqual(result.turnsExecuted, 3, 'Exactly 3 turns (attempt, restage, completion) should execute');
+  assert.strictEqual(result.stagedDiffsCount, 1, 'Single staged diff lifecycle tracked');
+
+  // 5. Verify PostgreSQL State
+  const task = await KruschStateManager.getTask(result.taskId);
+  assert.strictEqual(task.phase, HARNESS_PHASES.COMMITTED, 'PostgreSQL task phase must be COMMITTED');
+
+  const diffs = await query(
+    'SELECT * FROM krusch_staged_diffs WHERE task_id = $1 ORDER BY id ASC',
+    [result.taskId]
+  );
+  assert.strictEqual(diffs.rows.length, 1);
+  const diffRow = diffs.rows[0];
+  assert.strictEqual(diffRow.file_path, 'src/calculator.js');
+  assert.strictEqual(diffRow.status, 'COMMITTED', 'Diff status must be promoted to COMMITTED upon task commit');
+  assert.ok(diffRow.applied_at, 'applied_at timestamp must be recorded');
+
+  // Verify verification runs recorded in PostgreSQL
+  const verifications = await query(
+    'SELECT * FROM krusch_verification_runs WHERE task_id = $1 ORDER BY id ASC',
+    [result.taskId]
+  );
+  assert.strictEqual(verifications.rows.length, 2, 'Two verification runs must be recorded in PostgreSQL');
+  assert.strictEqual(verifications.rows[0].passed, false, 'First verification run must be recorded as failed');
+  assert.strictEqual(verifications.rows[0].exit_code, 1);
+  assert.strictEqual(verifications.rows[1].passed, true, 'Second verification run must be recorded as passed');
+  assert.strictEqual(verifications.rows[1].exit_code, 0);
+
+  // 6. Verify Physical File on Disk
+  const finalDiskContent = fs.readFileSync(calcFile, 'utf-8');
+  assert.strictEqual(finalDiskContent, correctStagedCode, 'Physical disk file must contain the committed code');
+
+  // 7. Verify real ground-truth test passes on physical disk now that diff is applied!
+  const finalGroundTruthTest = await KruschTestRunner.runCommand(`node test/calculator.test.js`, testDir);
+  assert.strictEqual(finalGroundTruthTest.passed, true, 'Physical test suite must pass after atomic apply');
+  assert.strictEqual(finalGroundTruthTest.exitCode, 0);
+
+  // 8. Capture and Save E2E Trajectory Fixture
+  const fixtureData = {
+    taskId: result.taskId,
+    goal: task.goal,
+    projectPath: testDir,
+    finalStatus: result.status,
+    turnsExecuted: result.turnsExecuted,
+    turns: task.turns.map(t => ({
+      turnNumber: t.turn_number,
+      modelId: t.model_id,
+      outputText: t.output_text,
+      routingStage: t.routing_stage
+    })),
+    verifications: verifications.rows.map(v => ({
+      id: v.id,
+      command: v.command,
+      exitCode: v.exit_code,
+      passed: v.passed,
+      createdAt: v.created_at
+    })),
+    stagedDiff: {
+      id: diffRow.id,
+      filePath: diffRow.file_path,
+      originalSha256: diffRow.original_sha256,
+      stagedSha256: diffRow.sha256_hash,
+      status: diffRow.status,
+      appliedAt: diffRow.applied_at
+    },
+    diskVerification: {
+      command: 'node test/calculator.test.js',
+      passed: finalGroundTruthTest.passed,
+      exitCode: finalGroundTruthTest.exitCode,
+      stdout: finalGroundTruthTest.stdout
+    },
+    recordedAt: new Date().toISOString()
+  };
+
+  const fixturePath = path.resolve(process.cwd(), 'test/fixtures/e2e-run.json');
+  fs.writeFileSync(fixturePath, JSON.stringify(fixtureData, null, 2), 'utf-8');
+  assert.ok(fs.existsSync(fixturePath), 'Fixture test/fixtures/e2e-run.json must exist');
+
+  // Clean up temporary repo
+  fs.rmSync(testDir, { recursive: true, force: true });
+});
+
+test.after(async () => {
+  await pool.end();
+});

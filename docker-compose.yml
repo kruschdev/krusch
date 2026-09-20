@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: krusch-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: krusch
+    ports:
+      - "5432:5432"
+    volumes:
+      - krusch-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d krusch"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Optional local Ollama model engine
+  # Start with: docker compose --profile with-ollama up -d
+  ollama:
+    image: ollama/ollama:latest
+    container_name: krusch-ollama
+    profiles:
+      - with-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - krusch-ollama:/root/.ollama
+
+volumes:
+  krusch-pgdata:
+  krusch-ollama:

@@ -1,6 +1,6 @@
 /**
- * Type declarations for Krusch Coding Harness.
- * PostgreSQL-grounded control plane for multi-model coding agents.
+ * Type declarations for Krusch Coding Harness (v0.1.0).
+ * Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.
  */
 
 export interface TaskRecord {
@@ -10,6 +10,7 @@ export interface TaskRecord {
   phase: HarnessPhase;
   current_model: string | null;
   metadata: Record<string, any>;
+  verification_command?: string | null;
   created_at: string;
   updated_at: string;
   turns?: TurnRecord[];
@@ -51,9 +52,10 @@ export interface StagedDiffRecord {
   original_content: string | null;
   staged_content: string;
   diff_patch: string | null;
-  status: 'PENDING' | 'APPLIED' | 'COMMITTED' | 'REJECTED';
+  status: 'PENDING' | 'APPLYING' | 'APPLIED' | 'COMMITTED' | 'REJECTED';
   sha256_hash: string;
   original_sha256: string | null;
+  lease_expires_at?: string | null;
   created_at: string;
   applied_at: string | null;
 }
@@ -86,6 +88,7 @@ export interface VerificationRunRecord {
   failure_module: string | null;
   extracted_errors: any[];
   created_at: string;
+  duration_ms?: number;
 }
 
 export function canonicalizePaths(projectPath: string, filePath: string): { projectPath: string; filePath: string };
@@ -109,6 +112,7 @@ export class KruschStateManager {
     phase?: HarnessPhase;
     currentModel?: string | null;
     metadata?: Record<string, any>;
+    verificationCommand?: string | null;
   }): Promise<TaskRecord>;
 
   static updateTask(
@@ -145,11 +149,31 @@ export class KruschStateManager {
     }
   ): Promise<StagedDiffRecord>;
 
+  static pruneExpiredLeases(): Promise<any[]>;
+
+  static releaseLease(taskId: string, filePath: string, projectPath?: string | null): Promise<StagedDiffRecord | null>;
+
+  static listActiveLeases(projectPath?: string | null): Promise<any[]>;
+
+  static recoverInFlightApplies(projectPath?: string | null): Promise<any[]>;
+
+  static applyDiffBatch(taskId: string, diffIds?: number[] | null, projectPath?: string | null): Promise<{
+    status: string;
+    appliedCount: number;
+    diffs?: Array<{ id: number; filePath: string }>;
+  }>;
+
+  static explainTaskStatus(taskId: string): Promise<any>;
+
+  static formatExplainOutput(explanation: any): string;
+
   static getPendingDiffs(taskId: string): Promise<StagedDiffRecord[]>;
+
+  static getStagedDiffs(taskId: string): Promise<StagedDiffRecord[]>;
 
   static getActiveDiffs(taskId: string): Promise<StagedDiffRecord[]>;
 
-  static updateDiffStatus(diffId: number, status: 'PENDING' | 'APPLIED' | 'COMMITTED' | 'REJECTED'): Promise<StagedDiffRecord>;
+  static updateDiffStatus(diffId: number, status: 'PENDING' | 'APPLYING' | 'APPLIED' | 'COMMITTED' | 'REJECTED'): Promise<StagedDiffRecord>;
 
   static requestApproval(
     taskId: string,
@@ -208,54 +232,97 @@ export class KruschStateManager {
   ): Promise<{ from: HarnessPhase; to: HarnessPhase; task: TaskRecord }>;
 }
 
+export interface RouteResult {
+  modelId: string;
+  stage: string;
+  confidence: string;
+  role: string;
+  ruleId?: string | null;
+  latencyMs: number;
+  costEstimate: string;
+  rationale: string;
+}
+
 export class KruschCascadeRouter {
-  specialists: Record<string, any>;
-  constructor(options?: { specialists?: Record<string, any> });
-  route(prompt: string, context?: Record<string, any>): Promise<{
-    selectedModel: string;
-    tier: string;
-    confidence: number;
-    reasoning: string;
-    stage: string;
-  }>;
+  specialists: Record<string, string>;
+  escalationPolicy: Record<string, any>;
+  constructor(options?: { customModels?: Record<string, string>; escalationPolicy?: Record<string, any> });
+  route(prompt: string, context?: Record<string, any>): RouteResult;
 }
 
 export class KruschTools {
   taskId: string;
   projectPath: string;
   policy: any;
-  constructor(taskId: string, projectPath: string, options?: { autoApprove?: boolean });
-  getToolDefinitions(): any[];
+  constructor(taskId: string, projectPath: string, options?: any);
+  getDefinitions(): any[];
   executeTool(name: string, args?: Record<string, any>): Promise<any>;
 }
 
 export class KruschStateMachine {
   constructor(options?: any);
-  run(goal: string, options?: any): Promise<any>;
+  runTask(params: {
+    goal: string;
+    projectPath?: string;
+    maxTurns?: number;
+    modelOverride?: string | null;
+  }): Promise<{
+    status: HarnessPhase;
+    taskId: string;
+    turnsExecuted: number;
+    stagedDiffsCount: number;
+    finalModel: string;
+  }>;
 }
 
 export class KruschTrajectoryGuard {
   constructor(options?: { maxTurns?: number; loopWindowSize?: number });
-  recordAction(action: any): { loopDetected: boolean; turnsExceeded: boolean; reason?: string };
+  evaluateTrajectory(turnHistory: any[]): { healthy: boolean; reason?: string; action?: string };
 }
 
+export const RSI_MODULES: {
+  AGENT_LOOP: string;
+  TOOL_USE: string;
+  OBSERVATION_MGMT: string;
+  CONTEXT_MGMT: string;
+  TASK_COMPLETION: string;
+};
+
+export const RSI_ACTION_TYPES: {
+  REFETCH_SYMBOLS: string;
+  SWITCH_TOOL_NORMALIZER: string;
+  FORMAT_ASSERTION_DIFF: string;
+  ESCALATE_TIER_OR_ABORT: string;
+};
+
 export class KruschModularRSI {
-  static attributeFailure(errorOutput: string): { module: string; diagnosis: string; recoveryPrompt: string };
+  static attributeFailure(testRun: any): {
+    module: string;
+    actionType: string;
+    missingSymbol?: string | null;
+    diagnosis: string;
+    remediation: string;
+  };
 }
 
 export class KruschTestRunner {
-  static runCommand(command: string, cwd: string): Promise<{
+  static detectTestCommand(projectPath?: string): string | null;
+  static parseErrors(stdout?: string, stderr?: string): any[];
+  static runCommand(command: string, cwd?: string, options?: any): Promise<{
     command: string;
     exitCode: number;
     stdout: string;
     stderr: string;
     passed: boolean;
+    durationMs: number;
+    extractedErrors?: any[];
   }>;
 }
 
 export class KruschApprovalPolicy {
-  constructor(rules?: any);
-  evaluate(actionType: string, args: any): { status: string; reason?: string };
+  autoApprove: boolean;
+  constructor(options?: any);
+  evaluate(toolName: string, args?: any): { status: 'AUTO_APPROVED' | 'STAGED' | 'REQUIRE_APPROVAL'; reason: string };
 }
 
 export function startMcpServer(): Promise<void>;

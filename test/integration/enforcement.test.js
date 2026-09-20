@@ -12,14 +12,14 @@ test('Enforcement: Test suite runs against live PostgreSQL with active CHECK con
   // Verify real PostgreSQL connection, not an in-memory mock
   const dbInfo = await query('SELECT current_database(), current_user, version()');
   assert.ok(dbInfo.rows.length > 0);
-  assert.strictEqual(dbInfo.rows[0].current_database, 'kdcode');
+  assert.ok(dbInfo.rows[0].current_database === 'kdcode' || dbInfo.rows[0].current_database === 'krusch');
   assert.ok(dbInfo.rows[0].version.includes('PostgreSQL 16'));
 
   // Verify DB-level CHECK constraints exist in PostgreSQL system catalogs
   const constraints = await query(`
     SELECT conname, pg_get_constraintdef(oid) as def
     FROM pg_constraint
-    WHERE conrelid = 'krusch_tasks'::regclass AND conname = 'chk_krusch_tasks_phase'
+    WHERE conrelid = 'krusch_tasks'::regclass AND conname IN ('chk_krusch_tasks_phase', 'krusch_tasks_phase_check')
   `);
   assert.strictEqual(constraints.rows.length, 1);
   assert.ok(constraints.rows[0].def.includes('INIT'));
@@ -678,6 +678,7 @@ test('Enforcement: Versioned migration catalog tracks applied migrations', async
   assert.ok(versions.includes('001_initial_schema'));
   assert.ok(versions.includes('002_harden_invariants'));
   assert.ok(versions.includes('003_phase_edges_and_lease_hardening'));
+  assert.ok(versions.includes('004_lease_lifecycle_and_path_canonicalization'));
 });
 
 test('Enforcement: Path canonicalization prevents lease bypass across relative, absolute, and dot-dot spellings', async () => {
@@ -974,6 +975,214 @@ test('Enforcement: Task row locking serializes concurrent verification runs and 
   assert.strictEqual(updatedTask.phase, HARNESS_PHASES.APPROVAL_GATE);
 
   await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+});
+
+test('Enforcement: Path canonicalization resolves a/../b to b in PostgreSQL and triggers unique lease collision', async () => {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-dotdot-test-'));
+  const task1 = `dotdot_task_1_${Date.now()}`;
+  const task2 = `dotdot_task_2_${Date.now()}`;
+
+  await KruschStateManager.createTask({
+    id: task1,
+    goal: 'Dot-dot task 1',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  await KruschStateManager.createTask({
+    id: task2,
+    goal: 'Dot-dot task 2',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  // Task 1 stages 'b'
+  const staged1 = await KruschStateManager.stageDiff(task1, {
+    filePath: 'b',
+    originalContent: '',
+    stagedContent: '// file b',
+    diffPatch: 'add b',
+    projectPath: testDir
+  });
+  assert.strictEqual(staged1.file_path, 'b');
+
+  // Task 2 attempts to stage 'a/../b' via stageDiff -> MUST FAIL
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.stageDiff(task2, {
+        filePath: 'a/../b',
+        originalContent: '',
+        stagedContent: '// file b collided',
+        diffPatch: 'collide b',
+        projectPath: testDir
+      });
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('CONCURRENCY_LEASE_CONFLICT') ||
+        err.message.includes('idx_krusch_staged_diffs_project_file_active')
+      );
+      return true;
+    }
+  );
+
+  // Raw SQL insert with 'a/../b' directly into PostgreSQL -> trigger normalizes to 'b' and collides on active index
+  await assert.rejects(
+    async () => {
+      await query(
+        `INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, staged_content, status)
+         VALUES ($1, $2, $3, $4, 'PENDING')`,
+        [task2, testDir, 'a/../b', '// raw SQL a/../b']
+      );
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('idx_krusch_staged_diffs_project_file_active') ||
+        err.message.includes('duplicate key value')
+      );
+      return true;
+    }
+  );
+
+  // Raw SQL insert attempting to escape repo root with '..' -> trigger rejects with check_violation
+  await assert.rejects(
+    async () => {
+      await query(
+        `INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, staged_content, status)
+         VALUES ($1, $2, $3, $4, 'PENDING')`,
+        [task2, testDir, '../../etc/passwd', '// exploit attempt']
+      );
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('path cannot escape repo root') ||
+        err.message.includes('check constraint') ||
+        err.code === '23514'
+      );
+      return true;
+    }
+  );
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, task1]);
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, task2]);
+  fs.rmSync(testDir, { recursive: true, force: true });
+});
+
+test('Enforcement: Diff COMMITTED status strictly implies parent task is in COMMITTED phase', async () => {
+  const taskId = `diff_committed_guard_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Guard diff committed status',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  const staged = await KruschStateManager.stageDiff(taskId, {
+    filePath: 'test/sample.js',
+    originalContent: '',
+    stagedContent: '// staged',
+    diffPatch: 'staged',
+    projectPath: process.cwd()
+  });
+
+  // Attempt direct SQL update of diff to COMMITTED while task is still in PLAN: MUST BE REJECTED
+  await assert.rejects(
+    async () => {
+      await query(`UPDATE krusch_staged_diffs SET status = 'COMMITTED' WHERE id = $1`, [staged.id]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('Invariant Violation'));
+      assert.ok(err.message.includes('must be COMMITTED'));
+      return true;
+    }
+  );
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+});
+
+test('Enforcement: Lease management is cleanly decoupled to AFTER UPDATE trigger', async () => {
+  const taskId = `decoupled_trigger_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test decoupled AFTER UPDATE trigger',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  const staged = await KruschStateManager.stageDiff(taskId, {
+    filePath: 'src/lease_decoupled.js',
+    originalContent: '',
+    stagedContent: '// decoupled',
+    diffPatch: 'decoupled test',
+    projectPath: process.cwd()
+  });
+
+  // Check triggers on krusch_tasks: BEFORE trigger handles validation, AFTER trigger handles lease release
+  const triggers = await query(`
+    SELECT tgname, tgtype
+    FROM pg_trigger
+    WHERE tgrelid = 'krusch_tasks'::regclass AND tgname IN ('trg_krusch_task_phase_transition', 'trg_manage_krusch_task_phase_leases')
+    ORDER BY tgname ASC;
+  `);
+  assert.strictEqual(triggers.rows.length, 2);
+
+  // Transition to ABORTED: AFTER trigger releases lease to REJECTED
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+  const diffCheck = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [staged.id]);
+  assert.strictEqual(diffCheck.rows[0].status, 'REJECTED');
+});
+
+test('Enforcement: Backfill safety preserves active leases for in-flight tasks (PLAN/VERIFY/IMPLEMENT)', async () => {
+  const inFlightTask = `inflight_task_${Date.now()}`;
+  const abortedTask = `aborted_task_${Date.now()}`;
+
+  await KruschStateManager.createTask({
+    id: inFlightTask,
+    goal: 'In-flight work in progress',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.IMPLEMENT
+  });
+
+  await KruschStateManager.createTask({
+    id: abortedTask,
+    goal: 'Dead task aborted previously',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.ABORTED
+  });
+
+  const stagedInFlight = await KruschStateManager.stageDiff(inFlightTask, {
+    filePath: 'src/live_work.js',
+    originalContent: '',
+    stagedContent: '// valuable in-flight code',
+    diffPatch: 'feature',
+    projectPath: process.cwd()
+  });
+
+  // Directly insert a staged diff for the aborted task to simulate legacy state before migration
+  const abortedDiffRes = await query(
+    `INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, staged_content, status)
+     VALUES ($1, $2, $3, $4, 'PENDING') RETURNING id`,
+    [abortedTask, process.cwd(), 'src/dead_work.js', '// dead code']
+  );
+  const abortedDiffId = abortedDiffRes.rows[0].id;
+
+  // Execute the safe backfill logic from migration 003
+  await query(`
+    UPDATE krusch_staged_diffs d
+    SET status = 'REJECTED'
+    FROM krusch_tasks t
+    WHERE d.task_id = t.id AND t.phase = 'ABORTED' AND d.status IN ('PENDING', 'APPLIED');
+  `);
+
+  // Verify in-flight task's staged diff is UNTOUCHED (PENDING), NOT rejected
+  const inFlightCheck = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [stagedInFlight.id]);
+  assert.strictEqual(inFlightCheck.rows[0].status, 'PENDING', 'In-flight staged work must never be marked REJECTED by migration backfill');
+
+  // Verify aborted task's staged diff was properly marked REJECTED
+  const abortedCheck = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [abortedDiffId]);
+  assert.strictEqual(abortedCheck.rows[0].status, 'REJECTED', 'Aborted task staged diff must be cleaned up to REJECTED');
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, inFlightTask]);
 });
 
 test.after(async () => {

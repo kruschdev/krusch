@@ -3,6 +3,8 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import path from 'path';
+import fs from 'fs';
+import readline from 'readline';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
@@ -15,30 +17,113 @@ import { KruschCascadeRouter, DEFAULT_SPECIALISTS } from '../src/router/cascade.
 import { KruschStateManager } from '../src/brain/state-manager.js';
 import { startMcpServer } from '../src/server/mcp-server.js';
 import { migrate } from '../db/migrate.js';
+import { query, pool } from '../src/brain/pool.js';
+import { HARNESS_PHASES } from '../src/workflow/fsm.js';
 
 const program = new Command();
 
 program
   .name('krusch')
-  .description('The sovereign, PostgreSQL-grounded coding harness for interchangeable LLMs')
-  .version('1.0.0');
+  .description('Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.')
+  .version('0.1.0');
 
-// 1. krusch run
+// 1. krusch init
+program
+  .command('init')
+  .description('Initialize environment, probe PostgreSQL connection, and apply schema migrations')
+  .action(async () => {
+    console.log(chalk.bold.cyan('\n🚀 KRUSCH HARNESS INITIALIZATION (v0.1.0)\n'));
+
+    const rootDir = path.resolve(__dirname, '..');
+    const envPath = path.join(rootDir, '.env');
+    const envExamplePath = path.join(rootDir, '.env.example');
+
+    // 1. Check or write .env
+    if (!fs.existsSync(envPath)) {
+      if (fs.existsSync(envExamplePath)) {
+        fs.copyFileSync(envExamplePath, envPath);
+        console.log(chalk.green('✓ Created .env from .env.example'));
+      } else {
+        const defaultEnv = 'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/krusch\nKRUSCH_AUTO_APPROVE=false\nKRUSCH_LEASE_TTL_MINUTES=15\n';
+        fs.writeFileSync(envPath, defaultEnv, 'utf-8');
+        console.log(chalk.green('✓ Created default .env'));
+      }
+    } else {
+      console.log(chalk.gray('✓ Found existing .env file'));
+    }
+
+    // Reload dotenv
+    dotenv.config({ path: envPath, override: true, quiet: true });
+    const dbUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/krusch';
+    console.log(chalk.gray(`  Database Target: ${dbUrl.replace(/:[^:@]+@/, ':****@')}`));
+
+    // 2. Probe PostgreSQL Connectivity
+    process.stdout.write('  Probing PostgreSQL connectivity... ');
+    try {
+      const probeRes = await query('SELECT version(), current_database()');
+      const pgVer = probeRes.rows[0]?.version?.split(' ')?.[1] || 'unknown';
+      const currentDb = probeRes.rows[0]?.current_database || 'unknown';
+      console.log(chalk.bold.green(`CONNECTED (PostgreSQL ${pgVer}, DB: ${currentDb})`));
+    } catch (err) {
+      console.log(chalk.bold.red('FAILED'));
+      console.error(chalk.red(`\n✗ Could not connect to PostgreSQL: ${err.message}`));
+      console.log(chalk.yellow('\nTroubleshooting:'));
+      console.log('  1. Ensure PostgreSQL is running: `docker compose up -d`');
+      console.log('  2. Verify DATABASE_URL in .env matches your credentials');
+      console.log('  3. Or run with mock adapter: `./bin/krusch.js run "<goal>" --mock`\n');
+      process.exit(1);
+    }
+
+    // 3. Run Migrations
+    console.log('\n  Checking & applying database migrations:');
+    try {
+      await migrate();
+
+      // 4. Run Startup Crash Recovery & Lease Pruning
+      const recovered = await KruschStateManager.recoverInFlightApplies(process.cwd());
+      if (recovered.length > 0) {
+        console.log(chalk.yellow(`  ✓ Recovered ${recovered.length} in-flight diff apply operation(s)`));
+      }
+      const pruned = await KruschStateManager.pruneExpiredLeases();
+      if (pruned.length > 0) {
+        console.log(chalk.yellow(`  ✓ Pruned ${pruned.length} expired file concurrency lease(s)`));
+      }
+
+      console.log(chalk.bold.green('\n✓ Krusch harness is fully initialized and ready!'));
+      console.log(chalk.gray('  Run a task:   ./bin/krusch.js run "your task description" --mock'));
+      console.log(chalk.gray('  Start MCP:    ./bin/krusch.js mcp\n'));
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Initialization failed: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 2. krusch run
 program
   .command('run <goal>')
   .description('Execute an engineering task through the Krusch invariant harness')
   .option('-m, --model <id>', 'Override model specialist')
   .option('-t, --max-turns <turns>', 'Maximum turns budget', '10')
   .option('-a, --auto-approve', 'Automatically approve staged diffs and actions', false)
-  .option('--mock', 'Run with local deterministic mock adapter', false)
+  .option('-c, --test-cmd <command>', 'Explicit ground-truth test/verification command override')
+  .option('--mock', 'Run with local deterministic mock adapter (zero cloud API keys needed)', false)
   .action(async (goal, options) => {
     console.log(chalk.bold.cyan('\n⚡ KRUSCH CODING HARNESS ⚡'));
     console.log(chalk.gray(`Goal: "${goal}"`));
-    console.log(chalk.gray(`Substrate: PostgreSQL (${process.env.DATABASE_URL || 'default kdcode'})`));
+    console.log(chalk.gray(`Substrate: PostgreSQL (${(process.env.DATABASE_URL || 'default').replace(/:[^:@]+@/, ':****@')})`));
+    if (options.testCmd) {
+      console.log(chalk.gray(`Test Command: "${options.testCmd}"`));
+    }
+    if (options.mock) {
+      console.log(chalk.yellow('Mode: Local Deterministic Mock Adapter (Offline/Demo)'));
+    }
 
     const harness = new KruschStateMachine({
       autoApprove: options.autoApprove,
       useMock: options.mock,
+      simulateMockTrajectory: options.mock,
+      pinnedModel: options.model
     });
 
     try {
@@ -47,6 +132,7 @@ program
         projectPath: process.cwd(),
         maxTurns: parseInt(options.maxTurns, 10),
         modelOverride: options.model,
+        verificationCommand: options.testCmd || null,
       });
 
       console.log('\n' + chalk.bold.green('✓ Task Execution Finished:'));
@@ -54,7 +140,31 @@ program
       console.log(`  Final Phase:    ${chalk.cyan(result.status)}`);
       console.log(`  Turns Executed: ${result.turnsExecuted}`);
       console.log(`  Staged Diffs:   ${result.stagedDiffsCount}`);
-      console.log(`  Final Model:    ${chalk.magenta(result.finalModel)}\n`);
+      console.log(`  Final Model:    ${chalk.magenta(result.finalModel)}`);
+
+      // Human-in-the-loop interactive approval gate prompt if diffs are pending
+      if (result.status === HARNESS_PHASES.APPROVAL_GATE && !options.autoApprove && result.stagedDiffsCount > 0) {
+        console.log(chalk.yellow(`\n⚠️  Task is waiting in APPROVAL_GATE with ${result.stagedDiffsCount} verified staged diff(s).`));
+        console.log(`Run ${chalk.cyan(`./bin/krusch.js diff ${result.taskId}`)} to inspect the diffs.`);
+
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise(resolve => {
+          rl.question(chalk.bold('Approve and apply staged diffs to working tree now? [y/N]: '), ans => {
+            rl.close();
+            resolve(ans.trim().toLowerCase());
+          });
+        });
+
+        if (answer === 'y' || answer === 'yes') {
+          console.log(chalk.gray('Applying staged diffs...'));
+          const batchRes = await KruschStateManager.applyDiffBatch(result.taskId, null, process.cwd());
+          await KruschStateManager.updateTask(result.taskId, { phase: HARNESS_PHASES.COMMITTED });
+          console.log(chalk.bold.green(`✓ Successfully applied ${batchRes.appliedCount} file(s) to working tree. Task COMMITTED.`));
+        } else {
+          console.log(chalk.gray('Diffs remain safely staged in PostgreSQL. Working tree untouched.'));
+        }
+      }
+      console.log();
       process.exit(0);
     } catch (err) {
       console.error(chalk.red(`\n✗ Harness Execution Error: ${err.message}`));
@@ -62,7 +172,7 @@ program
     }
   });
 
-// 2. krusch route
+// 3. krusch route
 program
   .command('route <prompt>')
   .description('Inspect cascade router decision for a prompt without executing it')
@@ -74,11 +184,13 @@ program
     console.log(`  Model:       ${chalk.yellow(route.modelId)}`);
     console.log(`  Role:        ${chalk.magenta(route.role)}`);
     console.log(`  Confidence:  ${route.confidence}`);
+    console.log(`  Cost Est:    ${chalk.cyan(route.costEstimate || 'N/A')}`);
+    console.log(`  Latency:     ${route.latencyMs}ms`);
     console.log(`  Rationale:   ${chalk.gray(route.rationale)}\n`);
     process.exit(0);
   });
 
-// 3. krusch models
+// 4. krusch models
 program
   .command('models')
   .description('List current specialist model pool and routing mappings')
@@ -91,11 +203,12 @@ program
     process.exit(0);
   });
 
-// 4. krusch status
+// 5. krusch status
 program
   .command('status <taskId>')
-  .description('Inspect task execution details, turns, and staged diffs from PostgreSQL')
-  .action(async (taskId) => {
+  .description('Inspect task execution details, turns, staged diffs, and verification trace from PostgreSQL')
+  .option('--trace', 'Print complete execution trace and invariant explanation', false)
+  .action(async (taskId, options) => {
     try {
       const task = await KruschStateManager.getTask(taskId);
       if (!task) {
@@ -109,7 +222,58 @@ program
       console.log(`  Turns:         ${task.turns.length}`);
       console.log(`  Staged Diffs:  ${task.stagedDiffs.length}`);
       console.log(`  Approvals:     ${task.approvals.length}`);
-      console.log(`  Verifications: ${task.verifications.length}\n`);
+      console.log(`  Verifications: ${task.verifications.length}`);
+
+      if (options.trace) {
+        const explanation = await KruschStateManager.explainTaskStatus(taskId);
+        console.log(chalk.bold.cyan('\n🔍 Detailed Invariant Diagnostic Trace:'));
+
+        if (explanation.latestVerification) {
+          const lv = explanation.latestVerification;
+          const statusStr = lv.passed ? chalk.green('PASSED (exit 0)') : chalk.red(`FAILED (exit ${lv.exitCode})`);
+          console.log(`  Latest Verification: ${statusStr}`);
+          console.log(`    Command: "${lv.command}"`);
+          if (lv.failureModule) {
+            console.log(`    Attributed Module: ${chalk.magenta(lv.failureModule)}`);
+          }
+        } else {
+          console.log(`  Latest Verification: ${chalk.gray('None recorded')}`);
+        }
+
+        if (task.stagedDiffs.length > 0) {
+          console.log(chalk.bold('\n  Staged Diffs & Leases:'));
+          for (const d of task.stagedDiffs) {
+            const statusColor = d.status === 'APPLIED' || d.status === 'COMMITTED'
+              ? chalk.green(d.status)
+              : d.status === 'PENDING' || d.status === 'APPLYING'
+                ? chalk.yellow(d.status)
+                : chalk.red(d.status);
+            console.log(`    - ID ${d.id}: ${chalk.bold(d.file_path)} [${statusColor}]`);
+            console.log(`      SHA-256: ${d.sha256_hash ? d.sha256_hash.slice(0, 16) + '...' : 'none'}`);
+            if (d.lease_expires_at) {
+              const remaining = Math.round((new Date(d.lease_expires_at).getTime() - Date.now()) / 1000);
+              console.log(`      Lease TTL: ${remaining > 0 ? `${remaining}s remaining` : chalk.red('EXPIRED')}`);
+            }
+          }
+        }
+
+        console.log(chalk.bold('\n  Transition Rules & Blockers:'));
+        for (const t of explanation.possibleTransitions) {
+          const isBlocked = t.reason.startsWith('BLOCKED');
+          const prefix = isBlocked ? chalk.red('  ✗') : chalk.green('  ✓');
+          console.log(`${prefix} ${chalk.bold(`${t.from} ➔ ${t.to}`)}: ${isBlocked ? chalk.red(t.reason) : chalk.gray(t.reason)}`);
+        }
+
+        // Show recent events
+        const eventsRes = await query('SELECT event_type, payload, created_at FROM krusch_events WHERE task_id = $1 ORDER BY id DESC LIMIT 5', [taskId]);
+        if (eventsRes.rows.length > 0) {
+          console.log(chalk.bold('\n  Recent Structured Events:'));
+          for (const ev of eventsRes.rows) {
+            console.log(`    - [${new Date(ev.created_at).toISOString().slice(11, 19)}] ${chalk.cyan(ev.event_type)}: ${JSON.stringify(ev.payload).slice(0, 80)}`);
+          }
+        }
+      }
+      console.log();
       process.exit(0);
     } catch (err) {
       console.error(chalk.red(`Error inspecting task: ${err.message}`));
@@ -117,7 +281,153 @@ program
     }
   });
 
-// 5. krusch mcp
+// 6. krusch explain
+program
+  .command('explain <taskId>')
+  .description('Explain why transitions or actions are allowed or blocked for a task')
+  .action(async (taskId) => {
+    try {
+      const exp = await KruschStateManager.explainTaskStatus(taskId);
+      if (!exp) {
+        console.error(chalk.red(`Task not found: ${taskId}`));
+        process.exit(1);
+      }
+      console.log('\n' + KruschStateManager.formatExplainOutput(exp) + '\n');
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`Error explaining task: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+// 7. krusch diff
+program
+  .command('diff <taskId>')
+  .description('Display or export unified diffs of all staged modifications for a task')
+  .option('-e, --export <filePath>', 'Export unified diff directly to a patch file')
+  .action(async (taskId, options) => {
+    try {
+      const task = await KruschStateManager.getTask(taskId);
+      if (!task) {
+        console.error(chalk.red(`Task not found: ${taskId}`));
+        process.exit(1);
+      }
+
+      if (task.stagedDiffs.length === 0) {
+        console.log(chalk.yellow(`No staged diffs found for task ${taskId}.`));
+        process.exit(0);
+      }
+
+      let fullPatch = '';
+      for (const diff of task.stagedDiffs) {
+        const origLines = (diff.original_content || '').split('\n');
+        const stagedLines = (diff.staged_content || '').split('\n');
+
+        fullPatch += `--- a/${diff.file_path}\n`;
+        fullPatch += `+++ b/${diff.file_path}\n`;
+        fullPatch += `@@ -1,${origLines.length} +1,${stagedLines.length} @@\n`;
+
+        for (const line of origLines) {
+          if (line) fullPatch += `-${line}\n`;
+        }
+        for (const line of stagedLines) {
+          if (line) fullPatch += `+${line}\n`;
+        }
+      }
+
+      if (options.export) {
+        fs.writeFileSync(options.export, fullPatch, 'utf-8');
+        console.log(chalk.green(`✓ Exported unified diff patch to ${options.export}`));
+      } else {
+        console.log(chalk.bold.cyan(`\n📝 Staged Diffs for Task ${taskId}:\n`));
+        const lines = fullPatch.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('+') && !line.startsWith('+++')) {
+            console.log(chalk.green(line));
+          } else if (line.startsWith('-') && !line.startsWith('---')) {
+            console.log(chalk.red(line));
+          } else if (line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++')) {
+            console.log(chalk.cyan(line));
+          } else {
+            console.log(line);
+          }
+        }
+        console.log();
+      }
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`Error generating diff: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+// 8. krusch lease
+const leaseCommand = program.command('lease').description('Inspect and manage single-writer file concurrency leases');
+
+leaseCommand
+  .command('list')
+  .description('List all active file concurrency leases across tasks')
+  .action(async () => {
+    try {
+      const leases = await KruschStateManager.listActiveLeases();
+      if (leases.length === 0) {
+        console.log(chalk.green('\n✓ No active file leases currently held.\n'));
+        process.exit(0);
+      }
+      console.log(chalk.bold.cyan(`\n🔒 Active Single-Writer File Leases (${leases.length}):\n`));
+      for (const l of leases) {
+        const remainingStr = l.is_expired
+          ? chalk.red('EXPIRED')
+          : `${l.seconds_remaining}s remaining`;
+        console.log(`  File:    ${chalk.bold(l.file_path)}`);
+        console.log(`  Task:    ${chalk.yellow(l.task_id)}`);
+        console.log(`  Status:  ${chalk.magenta(l.status)}`);
+        console.log(`  Expires: ${remainingStr}\n`);
+      }
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`Error listing leases: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+leaseCommand
+  .command('unlock <filePath>')
+  .description('Manually release a held lease on a file')
+  .option('-t, --task <taskId>', 'Specific holding task ID')
+  .action(async (filePath, options) => {
+    try {
+      const leases = await KruschStateManager.listActiveLeases();
+      const target = leases.find(l => l.file_path === filePath && (!options.task || l.task_id === options.task));
+      if (!target) {
+        console.log(chalk.yellow(`No active lease found for file '${filePath}'.`));
+        process.exit(0);
+      }
+
+      await KruschStateManager.releaseLease(target.task_id, filePath);
+      console.log(chalk.green(`✓ Successfully released lease on '${filePath}' held by task '${target.task_id}'.`));
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`Error releasing lease: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+leaseCommand
+  .command('prune')
+  .description('Prune all expired leases past their TTL')
+  .action(async () => {
+    try {
+      const pruned = await KruschStateManager.pruneExpiredLeases();
+      console.log(chalk.green(`✓ Pruned ${pruned.length} expired lease(s).`));
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`Error pruning leases: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+// 9. krusch mcp
 program
   .command('mcp')
   .description('Start Model Context Protocol (MCP) server over stdio')
@@ -125,7 +435,7 @@ program
     await startMcpServer();
   });
 
-// 6. krusch migrate
+// 10. krusch migrate
 program
   .command('migrate')
   .description('Run PostgreSQL schema migrations for Krusch')

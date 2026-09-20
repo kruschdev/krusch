@@ -1,214 +1,196 @@
 <p align="center">
-  <strong>KRUSCH: A PostgreSQL-Backed Control Plane for Multi-Model Coding Agents</strong><br>
-  <span>"The database is the brain; LLMs are swappable compute."</span>
+  <strong>KRUSCH (v0.1.0)</strong><br>
+  <span>Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree. Models are interchangeable workers.</span>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Node-%3E%3D18-blue.svg?style=flat-square" alt="Node Version">
-  <img src="https://img.shields.io/badge/PostgreSQL-16%20Transactional-blue.svg?style=flat-square" alt="PostgreSQL">
-  <img src="https://img.shields.io/badge/Routing-krusch--pre--router%20%2B%20cascade-green.svg?style=flat-square" alt="Routing">
-  <img src="https://img.shields.io/badge/FSM-Catalog%20Invariant%20Engine-orange.svg?style=flat-square" alt="DB Invariant Engine Enforced">
-  <img src="https://img.shields.io/badge/tests-28%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/version-0.1.0-blue.svg?style=flat-square" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/Node-%3E%3D20-blue.svg?style=flat-square" alt="Node Version">
+  <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
+  <img src="https://img.shields.io/badge/tests-48%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
----
-
-## What It Is
-
-`krusch` is a developer control plane and execution harness designed around a simple architectural thesis:
-
-> **The winning coding harness makes models interchangeable while keeping workflow, context, ground-truth tests, and approvals consistent.**
-
-Frontier and open-weights models churn rapidly. Most agent frameworks couple their execution loop to a single provider API and an ephemeral, in-process transcript. `krusch` stores primary state in PostgreSQL:
-* **Durable Task State**: Tasks, turns, execution events, and staged file diffs are persisted in PostgreSQL (`krusch_*` tables). If an LLM times out, hits a rate limit, or requires escalation, the next model resumes from the authoritative database record.
-* **Pre-Commit Staging & Crash-Safe Apply**: Model file edits are hashed and staged in PostgreSQL first. Physical disk files are only written when ground-truth verification passes, using atomic write + `fsync` + rename semantics.
-* **Working Tree Drift Protection & File Leases**: Staged diff apply employs optimistic concurrency control against disk drift. Repository-wide file staging is protected by database-enforced single-writer leases (`idx_krusch_staged_diffs_project_file_pending`).
-* **Fast Heuristic Routing**: Evaluates syntax, SQL, and closed-world queries on CPU (<15µs, $0.00) via sibling routers before dispatching to specialized models or escalating to frontier reasoning.
-* **Catalog-Level Invariant Engine**: Phase transitions, verification requirements (`VERIFY -> APPROVAL_GATE`), shortcut protections (`PLAN -> COMMITTED`), and diff apply permissions are enforced directly in PostgreSQL triggers and catalog constraints.
-* **Versioned Schema Migrations**: Atomic sequential migration engine (`db/migrations/001_...`, `002_...`) tracked durably in `krusch_schema_migrations`.
+> **Status**: *Experimental, single-maintainer, requires PostgreSQL.*
 
 ---
 
-## 🌐 Ecosystem Architecture & Stack Division
+## The Problem & The Contract
 
-`krusch` is part of a decoupled stack designed for sovereign agent engineering:
+Most AI coding agents write modifications directly to your working tree on physical disk, hoping the generated code compiles. When an LLM produces a broken patch, hallucinates an import, times out, or hits a rate limit halfway through a multi-file refactor, your repository is left in a dirty, broken state.
 
-| Layer | Package | Responsibility |
-|---|---|---|
-| **Control Plane & Harness** | `krusch` (This Repo) | Durable PostgreSQL task/turn FSM, ACID pre-commit diff staging, optimistic concurrency guards, failure attribution (`KruschModularRSI`), and CLI/MCP runner. |
-| **Context & Memory Engine** | `krusch-context-mcp` | Tree-sitter AST symbol indexing, repository topology, token budgeting, and pgvector embeddings for episodic memory. |
-| **Fast L1 CPU Gate** | `krusch-pre-router` | Zero-cost (<15µs, $0.00) CPU heuristic intercept for syntactic, SQL, and closed-world tasks. |
-| **Specialist Cascade** | `krusch-cascade-router` | Dynamic routing between cost-efficient specialist models and frontier reasoning models. |
+`krusch` treats file mutation as a real database transaction:
 
----
-
-## 🏛️ Invariant State Machine (FSM)
-
-Execution follows a strictly enforced finite state machine (`KruschFSM`):
-
-```mermaid
-stateDiagram-v2
-    [*] --> INIT
-    INIT --> PLAN : Assemble Context & Select Initial Specialist
-    PLAN --> IMPLEMENT : Model Emits stage_diff
-    IMPLEMENT --> VERIFY : Test Command Triggered
-    VERIFY --> IMPLEMENT : Test Failed (Modular Failure Attribution)
-    VERIFY --> APPROVAL_GATE : Ground-Truth Tests Passed (exitCode 0)
-    APPROVAL_GATE --> COMMITTED : User / Policy Approval (Atomic Disk Mutation)
-    APPROVAL_GATE --> IMPLEMENT : User Requests Modification
-    PLAN --> COMMITTED : Read-Only Task (No Staged Diffs)
-    PLAN --> ABORTED : Turn Budget Exceeded / Loop Detected
-    IMPLEMENT --> ABORTED
-    VERIFY --> ABORTED
-```
-
-### Hard Invariants
-1. **Catalog-Enforced Verification Gate**: `VERIFY ➔ APPROVAL_GATE` is strictly blocked at the PostgreSQL trigger level unless at least one verification run executed and the true latest run passed with `exit_code: 0`.
-2. **Catalog-Enforced Diff Apply Guard**: Marking staged diffs as `APPLIED` is strictly blocked at the PostgreSQL trigger level unless the parent task is in `APPROVAL_GATE` and verification tests passed.
-3. **Optimistic Working Tree Drift Detection**: `apply_staged_diff` verifies SHA-256 base hashes against the live disk file to reject overwrites if the file was modified externally during verification.
-4. **Single-Writer File Concurrency Leases**: Repository-wide file staging is protected by PostgreSQL unique partial index `(project_path, file_path) WHERE status = 'PENDING'`. Concurrent tasks cannot stage conflicting modifications on the same file.
-5. **No Staged Diff Shortcuts**: `PLAN ➔ COMMITTED` is strictly forbidden at both application and database catalog levels if any staged diffs exist. All code modifications must pass through `IMPLEMENT ➔ VERIFY ➔ APPROVAL_GATE`.
-6. **No Incomplete Commits**: `APPROVAL_GATE ➔ COMMITTED` is strictly rejected by database trigger if unapplied pending diffs remain.
-7. **Crash-Safe Apply**: Disk mutations use atomic file replacement (temp file write, `fsync`, and POSIX rename) before updating PostgreSQL diff status to `APPLIED`.
-8. **Catalog-Level Invariant Engine**: The state machine is enforced in PostgreSQL via `BEFORE UPDATE` triggers and constraints, aborting invalid transitions or unverified phase jumps even if executed via direct SQL (`psql`).
+1. **Diffs are Staged in PostgreSQL First**: Model-generated patches are SHA-256 hashed and inserted into `krusch_staged_diffs`. Physical files on disk are never touched during planning or drafting.
+2. **Ground-Truth Tests Must Pass**: Transition to `APPROVAL_GATE` is strictly rejected by database triggers unless automated test commands execute and pass with `exit_code: 0`.
+3. **Working Tree Drift Protection**: Before writing to disk, `krusch` verifies that the target file on disk matches the base hash recorded at staging time. If an external process or editor modified the file in the background, apply is refused.
+4. **Crash-Safe Two-Phase Apply**: When applying diffs, `krusch` journals intent (`APPLYING`), flushes content to a temporary sibling file with `fsync`, atomically renames it over the target, and marks it `APPLIED`. If the process crashes mid-apply, startup recovery verifies disk hashes and finishes or reverts the row automatically.
+5. **Single-Writer File Leases with TTL**: Tasks acquire exclusive leases on modified files. A configurable lease TTL (default 15 minutes) ensures that abandoned or crashed tasks cannot hold locks indefinitely.
 
 ---
 
-## 🚀 Quick Start
+## 5-Minute Quick Start
 
-### 1. Installation
-Clone and install dependencies:
+You don't need a homelab or cloud API keys to evaluate the architecture. You can stand up Postgres in Docker and run a complete mock engineering cycle in under two minutes:
+
+### 1. Launch PostgreSQL
 ```bash
-git clone https://github.com/kruschdev/krusch.git
-cd krusch
-npm install
-npm run migrate
+docker compose up -d
 ```
 
-### 2. Environment Setup
-Copy `.env.example` to `.env`:
-```ini
-# PostgreSQL Connection URL
-DATABASE_URL=postgresql://kdcode:password@localhost:5432/kdcode
-
-# Optional Provider Keys
-OPENROUTER_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
-GEMINI_API_KEY=your_key_here
-OLLAMA_HOST=http://localhost:11434
-```
-
-### 3. CLI Commands
-
-#### Inspect Cascade Routing
+### 2. Initialize Harness
 ```bash
-# Test sub-15µs heuristic routing for an obvious SQL query
-./bin/krusch.js route "SELECT * FROM users WHERE active = true"
-
-# Inspect active specialist catalog
-./bin/krusch.js models
+# Probes database connectivity, writes .env, and applies schema migrations
+./bin/krusch.js init
 ```
 
-#### Run an Engineering Task
+### 3. Run a Verified Task (Mock Mode)
 ```bash
-# Execute through the full harness loop
-./bin/krusch.js run "Add unit test for helper function"
-
-# Run with local deterministic mock adapter (offline / CI)
-./bin/krusch.js run --mock "Refactor error handling"
-
-# Inspect task execution record in PostgreSQL
-./bin/krusch.js status <taskId>
+# Runs complete FSM: PLAN -> stage_diff -> run_command -> VERIFY -> APPROVAL_GATE -> COMMITTED
+./bin/krusch.js run "Verify arithmetic module fix" --mock --auto-approve
 ```
-
-#### Launch Model Context Protocol (MCP) Server
-```bash
-./bin/krusch.js mcp
-```
-Connects over stdio, exposing `krusch_run`, `krusch_route`, `krusch_task_status`, and `krusch_apply_diff` to any IDE (Claude Code, Cursor, Antigravity, or custom workers).
 
 ---
 
-## 🧪 Verification & Test Suite
+## Product Contract
 
-The test suite validates router decisions, tool normalizers, trajectory loop guards, failure attribution, PostgreSQL persistence, database-level triggers, and strict disk mutation blocking on test failure:
+| Invariant / Mechanism | Behavior & Authority |
+|---|---|
+| **Authoritative State** | All task state, turns, events, verifications, approvals, and staged diffs persist to PostgreSQL (`krusch_*` tables). No primary state lives exclusively in ephemeral agent memory. |
+| **Enforced State Graph** | Transition edges are cataloged in `krusch_phase_edges`. Invalid transitions (`INIT -> COMMITTED`, terminal state mutations) are blocked at both application and SQL trigger levels. |
+| **No Unverified Apply** | `krusch_staged_diffs` cannot transition to `APPLYING` or `APPLIED` unless the parent task is in `APPROVAL_GATE` and the latest verification run passed (`exit_code: 0`). |
+| **No Shortcut Commits** | `PLAN -> COMMITTED` is blocked if any staged diffs exist. Staged modifications must progress through `IMPLEMENT -> VERIFY -> APPROVAL_GATE`. |
+| **No Incomplete Commits** | `APPROVAL_GATE -> COMMITTED` is blocked if unapplied diffs remain `PENDING`. |
+| **Two-Phase Apply Journal** | Diff status transitions `PENDING -> APPLYING -> APPLIED`. If a crash occurs, `recoverInFlightApplies()` inspects disk hashes on next boot: matching staged hash promotes to `APPLIED`; matching base hash reverts to `PENDING`; out-of-band drift marks `REJECTED` without clobbering disk; and partial-batch crashes roll back renamed files to base content and clean temporary files, preserving atomic multi-file apply. |
+| **Multi-File Batch Apply** | Multi-file diffs apply as an atomic unit: all target files are drift-checked upfront; if any file has drifted, the entire batch is aborted before touching disk. |
+| **Single-Writer Leases & TTL** | `(project_path, file_path)` is held under unique index while status is in `('PENDING', 'APPLYING', 'APPLIED')`. Expired leases past TTL are pruned automatically on startup or claimable. |
+
+---
+
+## Database Schema & State Authority
+
+State lives in eight core relational tables:
+
+- `krusch_tasks`: Task ID, goal, project path, current phase, active worker model, explicit verification command, and metadata.
+- `krusch_turns`: Model conversation history, token usage, latency, routing decision, and output text.
+- `krusch_events`: Structured event trail (`fsm_phase_transition`, `routing_decision`, `apply_started`, `apply_fsync`, `apply_completed`, `apply_failed`, `drift_detected`, `lease_expired`, `recovery_performed`).
+- `krusch_staged_diffs`: Pre-commit file content, original base content, SHA-256 hashes, status (`PENDING`, `APPLYING`, `APPLIED`, `COMMITTED`, `REJECTED`), and lease expiration timestamp.
+- `krusch_verification_runs`: Ground-truth test execution records (command, exit code, stdout, stderr, failure module attribution, and parsed error locations).
+- `krusch_approvals`: Human-in-the-loop and policy approval requests.
+- `krusch_phase_edges`: Canonical relational definition of legal state machine transitions.
+- `krusch_schema_migrations`: Versioned sequential migration history (`001` through `005`).
+
+---
+
+## Actionable Failure Attribution (Modular RSI)
+
+When ground-truth verification fails, `KruschModularRSI` decomposes the failure into five modules and alters the next action rather than blindly re-prompting:
+
+1. **`ContextManagement`** (Missing imports, undefined symbols, module resolution failures):
+   - Identifies the missing identifier and queries the AST symbol index.
+   - Injects targeted symbol definitions and file paths directly into the prompt.
+2. **`ToolUse`** (Syntax errors, JSON formatting errors, schema argument errors):
+   - Injects line-level syntax diagnostics and enforces strict parameter formatting.
+3. **`ObservationManagement`** (Assertion failures, expected vs received mismatches):
+   - Extracts the exact assertion diff and instructs the worker model to preserve invariants.
+4. **`AgentLoop`** (Exceeded turn budgets or cyclic loops):
+   - Automatically escalates model tier (e.g. to frontier reasoning) or terminates cleanly.
+
+---
+
+## CLI Commands
 
 ```bash
-# Run unit tests (12 tests)
+# Initialize database and environment
+krusch init
+
+# Run an engineering task (cloud models or local)
+krusch run "Fix race condition in pool.js"
+
+# Run deterministic mock demonstration (zero external API keys)
+krusch run "Simulate feature" --mock
+
+# Inspect deep diagnostic trace (phase, latest verification, pending diffs, blocker explanations)
+krusch status <taskId> --trace
+
+# Explain why a transition or action is allowed or blocked
+krusch explain <taskId>
+
+# View unified diff of all staged modifications for a task
+krusch diff <taskId>
+
+# Export unified diff directly to a patch file
+krusch diff <taskId> --export fix.patch
+
+# Inspect active file concurrency leases
+krusch lease list
+
+# Manually release a stuck lease on a file
+krusch lease unlock src/calculator.js
+
+# Prune all expired leases past their TTL
+krusch lease prune
+
+# Start Model Context Protocol (MCP) server over stdio
+krusch mcp
+
+# Run schema migrations
+krusch migrate
+```
+
+---
+
+## Model Context Protocol (MCP) Server
+
+`krusch` exposes an MCP server over stdio for IDE integration (Claude Code, Cursor, Antigravity, or custom agents):
+
+```bash
+krusch mcp
+```
+
+### Available MCP Tools:
+- **`krusch_run`**: Execute an engineering task through the harness.
+- **`krusch_route`**: Inspect model selection and cost estimates for a prompt without executing it.
+- **`krusch_task_status`**: Inspect full database state, turns, and staged diffs.
+- **`krusch_explain`**: Explain current task blockers and invariant checks.
+- **`krusch_diff`**: Retrieve unified diffs of staged modifications.
+- **`krusch_apply_diff`**: Apply verified staged diffs to disk (strictly guarded by `APPROVAL_GATE` and test passing).
+
+---
+
+## Optional Adapters & Ecosystem
+
+`krusch` is decoupled and focuses strictly on execution safety and PostgreSQL state authority. Sibling packages provide complementary capabilities:
+
+- **`krusch-pre-router`**: CPU heuristic gate intercepting obvious SQL, syntax, and closed-world tasks for $0.00 in <15µs.
+- **`krusch-cascade-router`**: Multi-tier cascade router balancing cost between edge specialists and frontier reasoning.
+- **`krusch-context-mcp`**: Symbol indexing and repository topology engine.
+
+---
+
+## Verification & Test Suite
+
+The test suite validates database triggers, invariant enforcement, two-phase apply transactions, crash recovery, multi-file atomic batch applies, lease TTLs, router golden sets, and CLI commands:
+
+```bash
+# Fast unit tests (13 tests)
 npm run test:unit
 
-# Run PostgreSQL integration & enforcement tests (16 tests)
+# PostgreSQL integration & invariant tests (35 tests)
 npm run test:integration
 
-# Run entire suite (28 tests)
+# Full test suite (48 tests)
 npm test
-```
 
-### Test Coverage Highlights:
-* `✔ Enforcement: Database trigger enforces verification invariant on VERIFY -> APPROVAL_GATE via raw SQL`
-* `✔ Enforcement: Database trigger enforces PLAN -> COMMITTED shortcut guard via raw SQL`
-* `✔ Enforcement: Database trigger enforces APPROVAL_GATE -> COMMITTED guard via raw SQL`
-* `✔ Enforcement: Database trigger prevents marking diff APPLIED unless task is in APPROVAL_GATE with passing tests`
-* `✔ Enforcement: Single-writer file concurrency lease prevents concurrent conflicting pending diffs`
-* `✔ Enforcement: Default task phase in PostgreSQL is INIT when omitted on INSERT`
-* `✔ Enforcement: Versioned migration catalog tracks applied migrations`
-* `✔ Enforcement: Database trigger rejects illegal phase transitions at PostgreSQL catalog level`
-* `✔ Enforcement: apply_staged_diff detects working tree drift and blocks overwrite`
-* `✔ Enforcement: Latest verification run strictly respects chronological ordering (ORDER BY id DESC, created_at DESC)`
-* `✔ Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporary directory`
-* `✔ Integration: Krusch PostgreSQL state persistence and task lifecycle`
-* `✔ Integration: KruschStateMachine executes task with MockModelAdapter`
-* `✔ KruschCascadeRouter: L1 fast-path intercepts SQL queries with <15µs CPU routing`
-* `✔ KruschCascadeRouter: Escalates to frontier reasoning when failure count > 0`
-* `✔ KruschModularRSI: attributes missing module to ContextManagement`
-* `✔ KruschTrajectoryGuard: detects repetitive n-gram loops`
+# Verify TypeScript definitions
+npm run typecheck
 
----
-
-## 📂 Codebase Layout
-
-```
-krusch/
-├── bin/
-│   └── krusch.js               # CLI binary entry point
-├── db/
-│   ├── migrate.js              # Versioned transactional migration runner
-│   └── migrations/             # Sequential migration files
-│       ├── 001_initial_schema.sql
-│       ├── 002_harden_invariants.sql
-│       └── 003_phase_edges_and_lease_hardening.sql
-├── src/
-│   ├── brain/
-│   │   ├── pool.js             # Resilient PostgreSQL connection pool
-│   │   ├── state-manager.js    # Task, turn, staged diff persistence & row locking
-│   │   └── context-client.js   # Token-bounded repo tree and symbol formatting
-│   ├── router/
-│   │   └── cascade.js          # krusch-pre-router L1 gate + specialist pool
-│   ├── models/
-│   │   ├── adapter-base.js     # Uniform model engine interface
-│   │   ├── tool-normalizer.js  # Multi-dialect schema & response normalizer
-│   │   └── providers/          # OpenRouter, Ollama, and Mock adapters
-│   ├── workflow/
-│   │   ├── fsm.js              # Enforced finite state machine & invariant guards
-│   │   ├── state-machine.js    # Invariant execution loop coordinator
-│   │   ├── trajectory-guard.js # Sliding n-gram loop & turn budget detector
-│   │   └── modular-rsi.js      # Module-level failure attribution engine
-│   ├── verify/
-│   │   └── test-runner.js      # Child process test executor & diagnostic parser
-│   ├── approvals/
-│   │   └── policy.js           # Action permission tiers (safe, staged, manual approval)
-│   ├── tools/
-│   │   └── index.js            # Standard tools (read, stage_diff, crash-safe apply)
-│   └── server/
-│       └── mcp-server.js       # Model Context Protocol stdio server
-├── types/
-│   └── index.d.ts              # Full TypeScript declarations for control plane API
-└── test/
-    ├── unit/                   # Router, normalizer, trajectory guard, modular-rsi tests
-    └── integration/            # Postgres state lifecycle, FSM invariants & crash-safe apply
+# Verify package manifest
+npm pack --dry-run
 ```
 
 ---
 
-## 📄 License
+## License
+
 MIT © 2026 Kevin Ruschman (KruschDev)

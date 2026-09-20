@@ -13,10 +13,25 @@ import { KruschStateMachine } from '../workflow/state-machine.js';
 import { KruschStateManager } from '../brain/state-manager.js';
 import { KruschCascadeRouter, DEFAULT_SPECIALISTS } from '../router/cascade.js';
 import { KruschTools } from '../tools/index.js';
+import { KruschApprovalPolicy } from '../approvals/policy.js';
 
 export async function startMcpServer() {
+  // Startup Crash Recovery & Lease Maintenance for long-lived MCP server
+  try {
+    const recovered = await KruschStateManager.recoverInFlightApplies();
+    if (recovered.length > 0) {
+      console.error(`[krusch:mcp] Recovered ${recovered.length} in-flight diff apply operation(s)`);
+    }
+    const pruned = await KruschStateManager.pruneExpiredLeases();
+    if (pruned.length > 0) {
+      console.error(`[krusch:mcp] Pruned ${pruned.length} expired file lease(s)`);
+    }
+  } catch (err) {
+    console.error(`[krusch:mcp] Startup recovery warning: ${err.message}`);
+  }
+
   const server = new Server(
-    { name: 'krusch-harness', version: '1.0.0' },
+    { name: 'krusch-harness', version: '0.1.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -28,7 +43,7 @@ export async function startMcpServer() {
       tools: [
         {
           name: 'krusch_run',
-          description: 'Execute an engineering task through the Krusch sovereign coding harness (Postgres brain + interchangeable models).',
+          description: 'Execute an engineering task through the Krusch invariant coding harness (Postgres state authority + interchangeable models).',
           inputSchema: {
             type: 'object',
             properties: {
@@ -62,8 +77,30 @@ export async function startMcpServer() {
           }
         },
         {
+          name: 'krusch_explain',
+          description: 'Explain why transitions or actions are allowed or blocked for a task based on PostgreSQL invariants.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              taskId: { type: 'string', description: 'Task ID' }
+            },
+            required: ['taskId']
+          }
+        },
+        {
+          name: 'krusch_diff',
+          description: 'View unified diff of all staged modifications for a task in PostgreSQL.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              taskId: { type: 'string', description: 'Task ID' }
+            },
+            required: ['taskId']
+          }
+        },
+        {
           name: 'krusch_apply_diff',
-          description: 'Approve and apply a staged diff row from PostgreSQL to physical disk.',
+          description: 'Approve and apply staged diffs from PostgreSQL to physical disk (guarded by verification passing and APPROVAL_GATE).',
           inputSchema: {
             type: 'object',
             properties: {
@@ -103,8 +140,33 @@ export async function startMcpServer() {
         return { content: [{ type: 'text', text: JSON.stringify(task, null, 2) }] };
       }
 
+      if (name === 'krusch_explain') {
+        const explanation = await KruschStateManager.explainTaskStatus(args.taskId);
+        if (!explanation) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(explanation, null, 2) }] };
+      }
+
+      if (name === 'krusch_diff') {
+        const task = await KruschStateManager.getTask(args.taskId);
+        if (!task) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+        }
+        const diffs = task.stagedDiffs.map(d => ({
+          id: d.id,
+          filePath: d.file_path,
+          status: d.status,
+          patch: d.diff_patch,
+          sha256: d.sha256_hash
+        }));
+        return { content: [{ type: 'text', text: JSON.stringify(diffs, null, 2) }] };
+      }
+
       if (name === 'krusch_apply_diff') {
-        const tools = new KruschTools(args.taskId, process.cwd(), { autoApprove: true });
+        const tools = new KruschTools(args.taskId, process.cwd(), {
+          policy: new KruschApprovalPolicy({ autoApprove: true })
+        });
         const res = await tools.executeTool('apply_staged_diff', { diffId: args.diffId });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }

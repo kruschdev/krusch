@@ -1,20 +1,30 @@
 {
   "name": "krusch",
-  "version": "1.0.0",
-  "description": "The sovereign, PostgreSQL-grounded coding harness for interchangeable LLMs.",
+  "version": "0.1.0",
+  "description": "Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.",
   "type": "module",
   "main": "src/index.js",
   "types": "types/index.d.ts",
+  "files": [
+    "bin",
+    "src",
+    "db",
+    "types",
+    "LICENSE",
+    "README.md",
+    "docker-compose.yml"
+  ],
   "bin": {
     "krusch": "./bin/krusch.js"
   },
   "scripts": {
     "start": "node bin/krusch.js",
     "mcp": "node bin/krusch.js mcp",
-    "test": "node --test test/unit/*.test.js test/integration/*.test.js",
+    "test": "node --test --test-concurrency=1 test/unit/*.test.js test/integration/*.test.js",
     "test:unit": "node --test test/unit/*.test.js",
-    "test:integration": "node --test test/integration/*.test.js",
-    "migrate": "node db/migrate.js"
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.js",
+    "migrate": "node db/migrate.js",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "coding-harness",
@@ -42,5 +52,9 @@
     "krusch-cascade-router": "github:kruschdev/krusch-cascade-router#d15130686b26c5ed5c0b63919a089d02f5672f4b",
     "krusch-pre-router": "github:kruschdev/krusch-pre-router#0e16455547e9e8a7dc4f995c9c47192bb681a2eb",
     "pg": "^8.13.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^5.9.3"
   }
 }
