@@ -14,8 +14,8 @@ export class KruschTools {
     this.verificationCommand = options.verificationCommand || null;
   }
 
-  getDefinitions() {
-    return [
+  getDefinitions(phase = null) {
+    const allDefs = [
       {
         name: 'read_file',
         description: 'Read the token-bounded text content of a file from the repository with line citations.',
@@ -67,7 +67,7 @@ export class KruschTools {
       },
       {
         name: 'apply_staged_diff',
-        description: 'Apply a staged diff from PostgreSQL to the physical disk (governed by approval policy).',
+        description: 'Apply a staged diff from PostgreSQL to physical disk (strictly guarded: verification must pass and task must be in APPROVAL_GATE).',
         parameters: {
           type: 'object',
           properties: {
@@ -77,9 +77,57 @@ export class KruschTools {
         }
       }
     ];
+
+    if (!phase) {
+      return allDefs;
+    }
+
+    switch (phase) {
+      case 'PLAN':
+        // Discovery & formulation; read-only mapping, no stage_diff or disk mutation
+        return allDefs.filter(t => ['read_file', 'search_symbols'].includes(t.name));
+      case 'IMPLEMENT':
+        // Active staging into PostgreSQL ACID storage; stage only
+        return allDefs.filter(t => ['read_file', 'search_symbols', 'stage_diff'].includes(t.name));
+      case 'VERIFY':
+        // Verification testing; run test commands against staged changes; no stage_diff or apply
+        return allDefs.filter(t => ['read_file', 'run_command'].includes(t.name));
+      case 'APPROVAL_GATE':
+        // Post-verification diff inspection and disk application; no new diffs
+        return allDefs.filter(t => ['read_file', 'apply_staged_diff'].includes(t.name));
+      default:
+        return allDefs;
+    }
   }
 
-  async executeTool(name, args = {}) {
+  async executeTool(name, args = {}, options = {}) {
+    // Phase Invariant 1: stage_diff can only be executed in IMPLEMENT
+    if (name === 'stage_diff' && options.phase && options.phase !== 'IMPLEMENT') {
+      return {
+        status: 'BLOCKED',
+        error: 'INVARIANT_VIOLATION',
+        message: `Cannot stage diff while task is in phase '${options.phase}'. Code staging is only permitted in IMPLEMENT phase.`
+      };
+    }
+
+    // Phase Invariant 2: apply_staged_diff can only be executed in APPROVAL_GATE
+    if (name === 'apply_staged_diff' && options.phase && options.phase !== 'APPROVAL_GATE') {
+      return {
+        status: 'BLOCKED',
+        error: 'INVARIANT_VIOLATION',
+        message: `Cannot apply staged diff to physical disk while task is in phase '${options.phase}'. Verification tests must pass and task must enter APPROVAL_GATE first.`
+      };
+    }
+
+    // Phase Invariant 3: run_command is blocked in PLAN
+    if (name === 'run_command' && options.phase && options.phase === 'PLAN') {
+      return {
+        status: 'BLOCKED',
+        error: 'INVARIANT_VIOLATION',
+        message: `Command execution is prohibited during PLAN phase. Use read_file and search_symbols to map the repository.`
+      };
+    }
+
     const policyResult = this.policy.evaluate(name, args);
 
     if (policyResult.status === 'REQUIRE_APPROVAL') {

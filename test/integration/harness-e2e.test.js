@@ -41,58 +41,93 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
   );
 
   // 2. Program deterministic MockModelAdapter for the end-to-end trajectory:
-  // Turn 1: Model proposes flawed stage_diff and runs failing verification command
-  // Turn 2: Model restages correct fix and runs passing verification command
+  // Turn 1 (PLAN): Model inspects buggy file via read_file
+  // Turn 2 (IMPLEMENT): Model stages flawed fix via stage_diff
+  // Turn 3 (VERIFY): Model runs verification test, which fails
+  // Turn 4 (IMPLEMENT): Model restages correct fix via stage_diff
+  // Turn 5 (VERIFY): Model runs verification test, which passes
   const mock = new MockModelAdapter();
 
-  // Turn 1 response: Flawed fix + failing verification
+  // Turn 1 (PLAN): Inspect repository
   mock.setNextResponse({
-    text: 'Attempting initial fix and running verification suite.',
+    text: 'Examining buggy calculator implementation.',
     toolCalls: [
       {
-        id: 'call_turn1_stage',
-        name: 'stage_diff',
-        args: {
-          path: 'src/calculator.js',
-          content: flawedStagedCode,
-          explanation: 'Initial fix attempt'
-        }
-      },
-      {
-        id: 'call_turn1_verify',
-        name: 'run_command',
-        args: {
-          command: 'node -e "console.error(\'AssertionError: Expected 5 but got 6\'); process.exit(1);"'
-        }
+        id: 'call_turn1_read',
+        name: 'read_file',
+        args: { path: 'src/calculator.js' }
       }
     ],
-    usage: { total_tokens: 120, prompt_tokens: 80, completion_tokens: 40 },
-    latencyMs: 15
+    usage: { total_tokens: 80, prompt_tokens: 50, completion_tokens: 30 },
+    latencyMs: 10
   });
 
-  // Turn 2 response: Correct fix + passing verification
+  // Turn 2 (IMPLEMENT): Stage flawed fix
   mock.setNextResponse({
-    text: 'Test failed with AssertionError. Restaging correct logic and running verification again.',
+    text: 'Staging initial fix into PostgreSQL.',
     toolCalls: [
       {
         id: 'call_turn2_stage',
         name: 'stage_diff',
         args: {
           path: 'src/calculator.js',
+          content: flawedStagedCode,
+          explanation: 'Initial fix attempt'
+        }
+      }
+    ],
+    usage: { total_tokens: 110, prompt_tokens: 70, completion_tokens: 40 },
+    latencyMs: 12
+  });
+
+  // Turn 3 (VERIFY): Run failing verification
+  mock.setNextResponse({
+    text: 'Running verification test suite.',
+    toolCalls: [
+      {
+        id: 'call_turn3_verify',
+        name: 'run_command',
+        args: {
+          command: 'node -e "console.error(\'AssertionError: Expected 5 but got 6\'); process.exit(1);"'
+        }
+      }
+    ],
+    usage: { total_tokens: 90, prompt_tokens: 60, completion_tokens: 30 },
+    latencyMs: 15
+  });
+
+  // Turn 4 (IMPLEMENT): Restage correct fix
+  mock.setNextResponse({
+    text: 'Restaging correct addition logic following test failure diagnosis.',
+    toolCalls: [
+      {
+        id: 'call_turn4_stage',
+        name: 'stage_diff',
+        args: {
+          path: 'src/calculator.js',
           content: correctStagedCode,
           explanation: 'Restaged correct addition logic'
         }
-      },
+      }
+    ],
+    usage: { total_tokens: 120, prompt_tokens: 75, completion_tokens: 45 },
+    latencyMs: 12
+  });
+
+  // Turn 5 (VERIFY): Run passing verification
+  mock.setNextResponse({
+    text: 'Re-running verification test suite.',
+    toolCalls: [
       {
-        id: 'call_turn2_verify',
+        id: 'call_turn5_verify',
         name: 'run_command',
         args: {
           command: 'node -e "console.log(\'Verification passed: add(2, 3) === 5\'); process.exit(0);"'
         }
       }
     ],
-    usage: { total_tokens: 140, prompt_tokens: 90, completion_tokens: 50 },
-    latencyMs: 12
+    usage: { total_tokens: 90, prompt_tokens: 60, completion_tokens: 30 },
+    latencyMs: 10
   });
 
   // 3. Execute KruschStateMachine harness
@@ -105,12 +140,12 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
   const result = await harness.runTask({
     goal: 'Fix add function in src/calculator.js and verify test suite',
     projectPath: testDir,
-    maxTurns: 3
+    maxTurns: 6
   });
 
   // 4. Assert Harness Execution Result
   assert.strictEqual(result.status, HARNESS_PHASES.COMMITTED, 'Task must reach COMMITTED state');
-  assert.strictEqual(result.turnsExecuted, 3, 'Exactly 3 turns (attempt, restage, completion) should execute');
+  assert.strictEqual(result.turnsExecuted, 5, 'Exactly 5 phased turns (plan, stage, verify-fail, restage, verify-pass) should execute');
   assert.strictEqual(result.stagedDiffsCount, 1, 'Single staged diff lifecycle tracked');
 
   // 5. Verify PostgreSQL State

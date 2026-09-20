@@ -20,8 +20,8 @@
    - Stage 1 (L1) microsecond CPU heuristic gate intercepts obvious SQL, syntax, math, and closed-world tasks for $0.00 in <15µs (`krusch-pre-router`).
    - Escalate to frontier reasoning (`claude-3-7-sonnet`, `deepseek-r1`) only on ambiguous intent, high complexity, or repeated verification failures.
 
-4. **Modular Self-Improvement**:
-   - Failures must be attributed to specific modules (`ContextManagement`, `ToolUse`, `ObservationManagement`, `AgentLoop`) using `KruschModularRSI` rather than blind re-prompting.
+4. **Actionable Failure Attribution**:
+   - Failures must be attributed to specific modules (`ContextManagement`, `ToolUse`, `ObservationManagement`, `AgentLoop`) using `KruschFailureClassifier` (`KruschModularRSI`) rather than blind re-prompting.
 
 ---
 
@@ -49,7 +49,7 @@
 - `src/brain/`: PostgreSQL state management, connection pooling, context retrieval (`krusch-context-mcp` bridge).
 - `src/router/`: Cascade router integrating `krusch-pre-router` and `krusch-cascade-router`.
 - `src/models/`: Normalized model adapters (OpenRouter, Anthropic, Gemini, Ollama, Mock).
-- `src/workflow/`: `KruschStateMachine`, `KruschTrajectoryGuard`, `KruschModularRSI`.
+- `src/workflow/`: `KruschStateMachine`, `KruschTrajectoryGuard`, `KruschFailureClassifier` (`KruschModularRSI`).
 - `src/verify/`: Ground-truth test runner and diff guards.
 - `src/approvals/`: Human-in-the-loop and automated approval policies.
 - `src/server/`: Model Context Protocol (MCP) stdio server.

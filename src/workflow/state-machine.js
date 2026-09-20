@@ -4,9 +4,37 @@ import { KruschCascadeRouter } from '../router/cascade.js';
 import { ModelRegistry } from '../models/registry.js';
 import { KruschTools } from '../tools/index.js';
 import { KruschTrajectoryGuard } from './trajectory-guard.js';
-import { KruschModularRSI, RSI_ACTION_TYPES } from './modular-rsi.js';
+import { KruschFailureClassifier, RSI_ACTION_TYPES } from './modular-rsi.js';
 import { KruschApprovalPolicy } from '../approvals/policy.js';
 import { KruschFSM, HARNESS_PHASES } from './fsm.js';
+
+function getPhaseObjective(phase, verificationCommand) {
+  switch (phase) {
+    case HARNESS_PHASES.PLAN:
+      return `[ACTIVE HARNESS PHASE: PLAN]
+Phase Objective: Read-only repository discovery and mapping.
+- Inspect relevant files with 'read_file' and locate symbols with 'search_symbols'.
+- Propose a concrete implementation plan.
+- Invariant Rule: Tool 'stage_diff' is strictly withheld in PLAN. Do not attempt disk mutations.`;
+    case HARNESS_PHASES.IMPLEMENT:
+      return `[ACTIVE HARNESS PHASE: IMPLEMENT]
+Phase Objective: Code modification and staging.
+- Stage atomic file updates directly into PostgreSQL ACID substrate using 'stage_diff'.
+- Invariant Rule: All staged diffs are stored in PostgreSQL; disk writes remain strictly blocked until verification passes.`;
+    case HARNESS_PHASES.VERIFY:
+      return `[ACTIVE HARNESS PHASE: VERIFY]
+Phase Objective: Ground-truth verification.
+- Execute the verification command using 'run_command'${verificationCommand ? ` (Target: "${verificationCommand}")` : ''}.
+- Invariant Rule: No new diffs can be staged in VERIFY. Validated pass (exit code 0) is required to unlock APPROVAL_GATE.`;
+    case HARNESS_PHASES.APPROVAL_GATE:
+      return `[ACTIVE HARNESS PHASE: APPROVAL_GATE]
+Phase Objective: Human-in-the-loop inspection and disk commit.
+- Verification tests have passed. Apply staged diffs to the working tree using 'apply_staged_diff'.
+- Invariant Rule: No new modifications may be staged.`;
+    default:
+      return `[ACTIVE HARNESS PHASE: ${phase}]`;
+  }
+}
 
 export class KruschStateMachine {
   constructor(options = {}) {
@@ -53,7 +81,6 @@ export class KruschStateMachine {
       policy: this.policy,
       verificationCommand: task.verification_command
     });
-    const toolDefs = tools.getDefinitions();
 
     // 2. Assemble Grounded Context from AST & Memory
     const context = await KruschContextClient.assembleContext(projectPath, goal);
@@ -88,10 +115,11 @@ Your goal: "${goal}"
 ${contextPromptBlock}
 
 Operating Workflow Rules:
-1. Always explore and read relevant files before modifying (use token-bounded 'read_file').
-2. Use 'stage_diff' to propose modifications into PostgreSQL ACID storage.
-3. Use 'run_command' to run existing tests or verify syntax.
-4. Changes can only be applied to physical disk once ground-truth verification passes.`;
+1. Phase-Scoped Tool Discipline: Each turn operates within an explicit FSM phase with designated tools.
+2. In PLAN phase: Inspect and read relevant files before modifying (use token-bounded 'read_file' and 'search_symbols').
+3. In IMPLEMENT phase: Use 'stage_diff' to propose modifications into PostgreSQL ACID storage.
+4. In VERIFY phase: Use 'run_command' to run existing tests or verify syntax.
+5. In APPROVAL_GATE phase: Apply staged diffs to disk via 'apply_staged_diff' once verified.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -102,6 +130,8 @@ Operating Workflow Rules:
     let consecutiveTestFailures = 0;
     let latestTestPassed = false;
     let latestFailureClass = null;
+    let remediationCount = 0;
+    const MAX_REMEDIATIONS = 3;
 
     for (let turnNum = 1; turnNum <= maxTurns; turnNum++) {
       console.log(`[krusch] ─── Turn ${turnNum}/${maxTurns} [Phase: ${fsm.currentPhase} | Model: ${route.modelId}] ───`);
@@ -125,19 +155,29 @@ Operating Workflow Rules:
         }
       }
 
-      // Execute Model Turn
+      // 1. Determine active phase and phase-scoped tool definitions
+      const activeToolDefs = tools.getDefinitions(fsm.currentPhase);
+      const phaseDirective = getPhaseObjective(fsm.currentPhase, task.verification_command);
+
+      // Inject active turn objective into turn messages
+      const turnMessages = [
+        ...messages,
+        { role: 'user', content: phaseDirective }
+      ];
+
+      // Execute Model Turn with phase-scoped tools
       const adapter = this.registry.getAdapter(route.modelId);
       const turnResult = await adapter.execute({
         modelId: route.modelId,
-        messages,
-        tools: toolDefs
+        messages: turnMessages,
+        tools: activeToolDefs
       });
 
       // Record Turn in PostgreSQL
       const recordedTurn = await KruschStateManager.recordTurn(task.id, {
         turnNumber: turnNum,
         modelId: route.modelId,
-        inputMessages: messages,
+        inputMessages: turnMessages,
         outputText: turnResult.text,
         tokenUsage: turnResult.usage,
         latencyMs: turnResult.latencyMs,
@@ -161,25 +201,21 @@ Operating Workflow Rules:
         }))
       });
 
-      // If no tool calls, model considers task finished
+      // If no tool calls, model considers current turn generation finished
       if (turnResult.toolCalls.length === 0) {
         console.log(`[krusch] Model finished generation without further tool invocations.`);
-        break;
+        const currentDiffs = await KruschStateManager.getStagedDiffs(task.id);
+        if (currentDiffs.length === 0 && fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
+          await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
+          console.log(`[krusch:fsm] Read-only task completed without staged diffs. Transitioned to COMMITTED.`);
+          break;
+        }
       }
 
       // Execute Tool Invocations
       for (const toolCall of turnResult.toolCalls) {
-        // FSM Transition on Action
-        if (toolCall.name === 'stage_diff' && (fsm.currentPhase === HARNESS_PHASES.PLAN || fsm.currentPhase === HARNESS_PHASES.VERIFY)) {
-          await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
-        } else if (toolCall.name === 'run_command') {
-          if (fsm.currentPhase === HARNESS_PHASES.PLAN || fsm.currentPhase === HARNESS_PHASES.IMPLEMENT) {
-            await fsm.transitionTo(HARNESS_PHASES.VERIFY);
-          }
-        }
-
         console.log(`[krusch] Executing tool [${toolCall.name}]:`, JSON.stringify(toolCall.args));
-        const result = await tools.executeTool(toolCall.name, toolCall.args);
+        const result = await tools.executeTool(toolCall.name, toolCall.args, { phase: fsm.currentPhase });
 
         // Record event in PostgreSQL
         await KruschStateManager.recordEvent(task.id, recordedTurn.id, `tool_${toolCall.name}`, {
@@ -187,35 +223,29 @@ Operating Workflow Rules:
           result
         });
 
-        // Test failure analysis via ModularRSI
+        // Test failure analysis via KruschFailureClassifier
         if (toolCall.name === 'run_command') {
           latestTestPassed = result.passed;
           if (!result.passed) {
             consecutiveTestFailures++;
-            const failureAttribution = KruschModularRSI.attributeFailure(result);
+            const failureAttribution = KruschFailureClassifier.attributeFailure(result);
             latestFailureClass = failureAttribution.module;
-            console.warn(`[krusch:rsi] Verification Failure attributed to [${failureAttribution.module}]: ${failureAttribution.diagnosis}`);
+            console.warn(`[krusch:classifier] Verification Failure attributed to [${failureAttribution.module}]: ${failureAttribution.diagnosis}`);
 
-            // Actionable ModularRSI Remediations:
-            if (failureAttribution.actionType === RSI_ACTION_TYPES.REFETCH_SYMBOLS && failureAttribution.missingSymbol) {
-              const matchedSymbols = await KruschContextClient.searchCodeSymbols(failureAttribution.missingSymbol, 5);
-              const symbolPrompt = matchedSymbols.length > 0
-                ? KruschContextClient.formatSymbols(matchedSymbols)
-                : `Symbol '${failureAttribution.missingSymbol}' not found in AST index. Ensure correct imports and package dependencies.`;
-              messages.push({
-                role: 'system',
-                content: `[KruschModularRSI Context Remediation]: The test failed due to an unresolved import/symbol: "${failureAttribution.missingSymbol}". Available symbols:\n${symbolPrompt}`
-              });
-            } else if (failureAttribution.actionType === RSI_ACTION_TYPES.FORMAT_ASSERTION_DIFF) {
-              messages.push({
-                role: 'system',
-                content: `[KruschModularRSI Assertion Remediation]: Ground-truth verification assertions failed. Invariant rule: Staged code modifications must satisfy assertions without regressing existing behavior.\nDiagnosis: ${failureAttribution.diagnosis}\nRemediation: ${failureAttribution.remediation}`
-              });
-            } else if (failureAttribution.actionType === RSI_ACTION_TYPES.SWITCH_TOOL_NORMALIZER) {
-              messages.push({
-                role: 'system',
-                content: `[KruschModularRSI ToolUse Remediation]: Syntactic or parameter formatting error detected. Ensure exact parameter schema compliance and valid JavaScript/TypeScript syntax before re-staging.`
-              });
+            let remediationPayload = null;
+            if (remediationCount < MAX_REMEDIATIONS) {
+              remediationCount++;
+              remediationPayload = {
+                module: failureAttribution.module,
+                actionType: failureAttribution.actionType,
+                diagnosis: failureAttribution.diagnosis,
+                remediation: failureAttribution.remediation
+              };
+
+              if (failureAttribution.actionType === RSI_ACTION_TYPES.REFETCH_SYMBOLS && failureAttribution.missingSymbol) {
+                const matchedSymbols = await KruschContextClient.searchCodeSymbols(failureAttribution.missingSymbol, 5);
+                remediationPayload.matchedSymbols = matchedSymbols;
+              }
             }
 
             // Escalate model if multiple consecutive verification failures occur
@@ -236,13 +266,17 @@ Operating Workflow Rules:
               tool_call_id: toolCall.id,
               content: JSON.stringify({
                 output: result.stdout || result.stderr,
-                rsi_diagnostic: failureAttribution
+                exit_code: result.exitCode,
+                passed: false,
+                diagnostic: failureAttribution.diagnosis,
+                remediation: remediationPayload
               })
             });
             continue;
           } else {
             consecutiveTestFailures = 0;
             latestFailureClass = null;
+            console.log(`[krusch:verify] Verification passed with exit code 0.`);
           }
         }
 
@@ -252,44 +286,54 @@ Operating Workflow Rules:
           content: JSON.stringify(result)
         });
       }
+
+      // ─── Post-Turn State-Evidence Evaluation ───
+      const pendingDiffs = await KruschStateManager.getPendingDiffs(task.id);
+      const latestRun = await KruschStateManager.getLatestVerificationRun(task.id);
+
+      if (fsm.currentPhase === HARNESS_PHASES.PLAN) {
+        if (turnResult.toolCalls.length === 0 && pendingDiffs.length === 0) {
+          if (fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
+            await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
+            console.log(`[krusch:fsm] Read-only task completed in PLAN phase. Transitioned to COMMITTED.`);
+            break;
+          }
+        } else {
+          await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
+          console.log(`[krusch:fsm] Planning turn concluded. Transitioned PLAN -> IMPLEMENT.`);
+        }
+      } else if (fsm.currentPhase === HARNESS_PHASES.IMPLEMENT) {
+        if (pendingDiffs.length > 0) {
+          await fsm.transitionTo(HARNESS_PHASES.VERIFY);
+          console.log(`[krusch:fsm] Staged diffs detected (${pendingDiffs.length}). Transitioned IMPLEMENT -> VERIFY.`);
+        }
+      } else if (fsm.currentPhase === HARNESS_PHASES.VERIFY) {
+        if (latestRun && latestRun.passed && latestRun.exit_code === 0) {
+          await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
+          console.log(`[krusch:fsm] Ground-truth verification PASSED. Transitioned VERIFY -> APPROVAL_GATE.`);
+
+          if (this.policy.autoApprove) {
+            const batchResult = await KruschStateManager.applyDiffBatch(task.id, null, projectPath);
+            await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
+            console.log(`[krusch:fsm] Auto-applied ${batchResult.appliedCount} staged diff(s) to physical disk. Task COMMITTED.`);
+          }
+          break;
+        } else if (latestRun && !latestRun.passed) {
+          await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
+          console.warn(`[krusch:fsm] Verification failed. Transitioned VERIFY -> IMPLEMENT to allow restaging.`);
+        }
+      }
     }
 
-    // Check for pending staged diffs and finalize FSM phase
-    const pendingDiffs = await KruschStateManager.getPendingDiffs(task.id);
+    // Check for pending staged diffs and return authoritative status
     const allDiffs = await KruschStateManager.getStagedDiffs(task.id);
-    const hasRejected = allDiffs.some(d => d.status === 'REJECTED');
-
-    if (hasRejected) {
-      console.warn(`[krusch] Task contains REJECTED staged diff(s). Preserving working tree; modifications must be re-staged and re-verified.`);
-    } else if (pendingDiffs.length > 0) {
-      if (latestTestPassed && fsm.currentPhase === HARNESS_PHASES.VERIFY) {
-        // Safe to enter APPROVAL_GATE
-        await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
-        console.log(`[krusch] Verification PASSED. Task entered APPROVAL_GATE with ${pendingDiffs.length} staged diff(s).`);
-
-        // If auto-approve policy active, apply all diffs to disk as an atomic batch unit
-        if (this.policy.autoApprove) {
-          const batchResult = await KruschStateManager.applyDiffBatch(task.id, null, projectPath);
-          await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
-          console.log(`[krusch] Auto-applied ${batchResult.appliedCount} staged diff(s) to physical disk.`);
-        }
-      } else if (!latestTestPassed && fsm.currentPhase === HARNESS_PHASES.VERIFY) {
-        console.warn(`[krusch] Verification FAILED. Diffs remain staged in PostgreSQL; disk mutation strictly blocked.`);
-      }
-    } else {
-      if (fsm.currentPhase !== HARNESS_PHASES.ABORTED) {
-        if (fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
-          await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
-        }
-      }
-    }
-
     return {
       status: fsm.currentPhase,
       taskId: task.id,
       turnsExecuted: turnHistory.length,
-      stagedDiffsCount: pendingDiffs.length,
+      stagedDiffsCount: allDiffs.length,
       finalModel: route.modelId
     };
   }
 }
+

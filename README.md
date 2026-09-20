@@ -7,8 +7,9 @@
   <img src="https://img.shields.io/badge/version-0.1.0-blue.svg?style=flat-square" alt="Version 0.1.0">
   <img src="https://img.shields.io/badge/Node-%3E%3D20-blue.svg?style=flat-square" alt="Node Version">
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
+  <a href="https://github.com/kruschDev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschDev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
-  <img src="https://img.shields.io/badge/tests-48%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-57%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 > **Status**: *Experimental, single-maintainer, requires PostgreSQL.*
@@ -69,7 +70,7 @@ docker compose up -d
 
 ## Database Schema & State Authority
 
-State lives in eight core relational tables:
+State lives in ten core relational tables:
 
 - `krusch_tasks`: Task ID, goal, project path, current phase, active worker model, explicit verification command, and metadata.
 - `krusch_turns`: Model conversation history, token usage, latency, routing decision, and output text.
@@ -78,13 +79,15 @@ State lives in eight core relational tables:
 - `krusch_verification_runs`: Ground-truth test execution records (command, exit code, stdout, stderr, failure module attribution, and parsed error locations).
 - `krusch_approvals`: Human-in-the-loop and policy approval requests.
 - `krusch_phase_edges`: Canonical relational definition of legal state machine transitions.
-- `krusch_schema_migrations`: Versioned sequential migration history (`001` through `005`).
+- `krusch_code_symbols`: Native AST symbols index for self-contained context grounding.
+- `krusch_memories`: Native episodic task decisions and context entries.
+- `krusch_schema_migrations`: Versioned sequential migration history (`001` through `008`).
 
 ---
 
-## Actionable Failure Attribution (Modular RSI)
+## Actionable Failure Attribution & Targeted Remediation
 
-When ground-truth verification fails, `KruschModularRSI` decomposes the failure into five modules and alters the next action rather than blindly re-prompting:
+When ground-truth verification fails, `KruschFailureClassifier` (also exported as `KruschModularRSI`) parses test stdout and stderr into four modular failure classes, injecting structured diagnostics into the prompt rather than blindly re-prompting:
 
 1. **`ContextManagement`** (Missing imports, undefined symbols, module resolution failures):
    - Identifies the missing identifier and queries the AST symbol index.
@@ -162,7 +165,7 @@ krusch mcp
 
 `krusch` is decoupled and focuses strictly on execution safety and PostgreSQL state authority. Sibling packages provide complementary capabilities:
 
-- **`krusch-pre-router`**: CPU heuristic gate intercepting obvious SQL, syntax, and closed-world tasks for $0.00 in <15µs.
+- **`krusch-pre-router`**: Fast CPU heuristic filter intercepting closed-world queries (pure SQL, syntax checks, arithmetic) for $0.00 in <15µs to avoid unnecessary LLM invocation costs.
 - **`krusch-cascade-router`**: Multi-tier cascade router balancing cost between edge specialists and frontier reasoning.
 - **`krusch-context-mcp`**: Symbol indexing and repository topology engine.
 
@@ -173,13 +176,13 @@ krusch mcp
 The test suite validates database triggers, invariant enforcement, two-phase apply transactions, crash recovery, multi-file atomic batch applies, lease TTLs, router golden sets, and CLI commands:
 
 ```bash
-# Fast unit tests (13 tests)
+# Fast unit tests (17 tests)
 npm run test:unit
 
-# PostgreSQL integration & invariant tests (35 tests)
+# PostgreSQL integration & invariant tests (40 tests)
 npm run test:integration
 
-# Full test suite (48 tests)
+# Full test suite (57 tests)
 npm test
 
 # Verify TypeScript definitions

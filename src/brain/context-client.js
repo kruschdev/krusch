@@ -1,12 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 import { query } from './pool.js';
+import { KruschSymbolIndexer } from './indexer.js';
 
 export class KruschContextClient {
   /**
    * Assemble grounded context for a prompt or file scope.
    */
   static async assembleContext(projectPath, queryText = '', options = {}) {
+    if (options.indexSymbols !== false) {
+      try {
+        await KruschSymbolIndexer.indexProject(projectPath, { maxFiles: 30 });
+      } catch (_) {}
+    }
+
     const symbolMatches = await this.searchCodeSymbols(queryText, options.limit || 10);
     const recentMemories = await this.getRecentMemories(5);
     const repoFiles = await this.getProjectFiles(projectPath, options.maxFiles || 50);
@@ -53,47 +60,86 @@ export class KruschContextClient {
    * Build a token-budgeted markdown context block for the system prompt.
    */
   static formatContextPrompt(context) {
-    return `### Repository Structure:
+    let block = `### Repository Structure:
 ${context.formattedTree}
 
 ### Relevant Symbols (AST / Vector Search):
 ${context.formattedSymbols}`;
+
+    if (context.memories && context.memories.length > 0) {
+      const memoryLines = context.memories
+        .map(m => `- [${m.category || 'context'}] ${m.content}`)
+        .join('\n');
+      block += `\n\n### Relevant Prior Context & Decisions:
+${memoryLines}`;
+    }
+
+    return block;
   }
 
   /**
    * Search code symbols in PostgreSQL via exact match, trigram, or tsvector.
+   * Checks native krusch_code_symbols table first, falling back to legacy code_symbols if present.
    */
   static async searchCodeSymbols(queryTerm, limit = 10) {
     if (!queryTerm || queryTerm.trim() === '') return [];
     try {
       const sql = `
         SELECT file_path, symbol_name, symbol_type, start_line, end_line, signature
-        FROM code_symbols
+        FROM krusch_code_symbols
         WHERE symbol_name ILIKE $1 OR signature ILIKE $1
         ORDER BY LENGTH(symbol_name) ASC
         LIMIT $2;
       `;
       const res = await query(sql, [`%${queryTerm.trim()}%`, limit]);
+      if (res && res.rows && res.rows.length > 0) {
+        return res.rows;
+      }
+    } catch (_) {}
+
+    try {
+      const legacySql = `
+        SELECT file_path, symbol_name, symbol_type, start_line, end_line, signature
+        FROM code_symbols
+        WHERE symbol_name ILIKE $1 OR signature ILIKE $1
+        ORDER BY LENGTH(symbol_name) ASC
+        LIMIT $2;
+      `;
+      const res = await query(legacySql, [`%${queryTerm.trim()}%`, limit]);
       return res.rows;
-    } catch (err) {
+    } catch (_) {
       return [];
     }
   }
 
   /**
    * Retrieve recent episodic memories from PostgreSQL.
+   * Checks native krusch_memories table first, falling back to legacy ide_agent_memory if present.
    */
   static async getRecentMemories(limit = 5) {
     try {
       const sql = `
+        SELECT id, content, category, tags, project_path, created_at
+        FROM krusch_memories
+        ORDER BY created_at DESC
+        LIMIT $1;
+      `;
+      const res = await query(sql, [limit]);
+      if (res && res.rows && res.rows.length > 0) {
+        return res.rows;
+      }
+    } catch (_) {}
+
+    try {
+      const legacySql = `
         SELECT id, content, category, tags, project, created_at
         FROM ide_agent_memory
         ORDER BY created_at DESC
         LIMIT $1;
       `;
-      const res = await query(sql, [limit]);
+      const res = await query(legacySql, [limit]);
       return res.rows;
-    } catch (err) {
+    } catch (_) {
       return [];
     }
   }
@@ -127,5 +173,23 @@ ${context.formattedSymbols}`;
       // Ignore scan errors
     }
     return files;
+  }
+
+  /**
+   * Record an episodic memory or task decision into native krusch_memories table.
+   */
+  static async recordMemory({ projectPath = '', category = 'general', content, tags = [], taskId = null }) {
+    if (!content) return null;
+    try {
+      const sql = `
+        INSERT INTO krusch_memories (project_path, category, content, tags, task_id, created_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        RETURNING *;
+      `;
+      const res = await query(sql, [projectPath, category, content, tags, taskId]);
+      return res.rows[0];
+    } catch (_) {
+      return null;
+    }
   }
 }

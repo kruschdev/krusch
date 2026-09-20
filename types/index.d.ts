@@ -255,8 +255,8 @@ export class KruschTools {
   projectPath: string;
   policy: any;
   constructor(taskId: string, projectPath: string, options?: any);
-  getDefinitions(): any[];
-  executeTool(name: string, args?: Record<string, any>): Promise<any>;
+  getDefinitions(phase?: HarnessPhase | string | null): any[];
+  executeTool(name: string, args?: Record<string, any>, options?: { phase?: HarnessPhase | string | null }): Promise<any>;
 }
 
 export class KruschStateMachine {
@@ -295,7 +295,7 @@ export const RSI_ACTION_TYPES: {
   ESCALATE_TIER_OR_ABORT: string;
 };
 
-export class KruschModularRSI {
+export class KruschFailureClassifier {
   static attributeFailure(testRun: any): {
     module: string;
     actionType: string;
@@ -304,6 +304,8 @@ export class KruschModularRSI {
     remediation: string;
   };
 }
+
+export const KruschModularRSI: typeof KruschFailureClassifier;
 
 export class KruschTestRunner {
   static detectTestCommand(projectPath?: string): string | null;
@@ -323,6 +325,22 @@ export class KruschApprovalPolicy {
   autoApprove: boolean;
   constructor(options?: any);
   evaluate(toolName: string, args?: any): { status: 'AUTO_APPROVED' | 'STAGED' | 'REQUIRE_APPROVAL'; reason: string };
+}
+
+export class KruschSymbolIndexer {
+  static indexProject(projectPath: string, options?: { maxFiles?: number }): Promise<{ filesScanned: number; symbolsIndexed: number }>;
+  static extractSymbolsFromFile(filePath: string, relativePath: string, projectPath: string): any[];
+}
+
+export class KruschContextClient {
+  static assembleContext(projectPath: string, queryText?: string, options?: any): Promise<any>;
+  static formatRepoTree(files: string[], maxLines?: number): string;
+  static formatSymbols(symbols: any[]): string;
+  static formatContextPrompt(context: any): string;
+  static searchCodeSymbols(queryTerm: string, limit?: number): Promise<any[]>;
+  static getRecentMemories(limit?: number): Promise<any[]>;
+  static getProjectFiles(projectPath: string, maxFiles?: number): Promise<string[]>;
+  static recordMemory(params: { projectPath?: string; category?: string; content: string; tags?: string[]; taskId?: string | null }): Promise<any>;
 }
 
 export function startMcpServer(): Promise<void>;

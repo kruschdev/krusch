@@ -28,8 +28,26 @@ export class MockModelAdapter extends BaseModelAdapter {
 
     if (this.simulateTrajectory) {
       if (this.callCount === 1) {
+        // PLAN Phase: read-only mapping and inspection
         return {
-          text: 'Analyzing goal and proposing verified code update.',
+          text: 'Examining repository structure and preparing implementation hypothesis.',
+          toolCalls: [
+            {
+              id: 'call_mock_read_1',
+              name: 'read_file',
+              args: {
+                path: 'package.json'
+              }
+            }
+          ],
+          usage: { total_tokens: 80, prompt_tokens: 50, completion_tokens: 30 },
+          latencyMs: 5,
+          modelId
+        };
+      } else if (this.callCount === 2) {
+        // IMPLEMENT Phase: stage verified diff into PostgreSQL
+        return {
+          text: 'Staging verified code modification into PostgreSQL ACID storage.',
           toolCalls: [
             {
               id: 'call_mock_stage_1',
@@ -39,7 +57,17 @@ export class MockModelAdapter extends BaseModelAdapter {
                 content: '// Krusch verified code update\nexport function demo() { return "verified"; }\n',
                 explanation: 'Simulated code improvement'
               }
-            },
+            }
+          ],
+          usage: { total_tokens: 120, prompt_tokens: 80, completion_tokens: 40 },
+          latencyMs: 8,
+          modelId
+        };
+      } else if (this.callCount === 3) {
+        // VERIFY Phase: run verification command against staged changes
+        return {
+          text: 'Running verification test suite to validate staged modifications.',
+          toolCalls: [
             {
               id: 'call_mock_verify_1',
               name: 'run_command',
@@ -48,8 +76,8 @@ export class MockModelAdapter extends BaseModelAdapter {
               }
             }
           ],
-          usage: { total_tokens: 120, prompt_tokens: 80, completion_tokens: 40 },
-          latencyMs: 8,
+          usage: { total_tokens: 90, prompt_tokens: 60, completion_tokens: 30 },
+          latencyMs: 6,
           modelId
         };
       } else {

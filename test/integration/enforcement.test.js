@@ -1185,6 +1185,50 @@ test('Enforcement: Backfill safety preserves active leases for in-flight tasks (
   await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, inFlightTask]);
 });
 
+test('Invariant Test (b): IMPLEMENT cannot jump to COMMITTED with pending diffs even via updateTask', async () => {
+  const taskId = `enforce_impl_commit_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test direct updateTask bypass prevention from IMPLEMENT to COMMITTED',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  // Advance task legitimately from PLAN to IMPLEMENT
+  await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.IMPLEMENT });
+
+  // Stage a diff into PostgreSQL (status: PENDING)
+  const staged = await KruschStateManager.stageDiff(taskId, {
+    filePath: 'src/pending_bypass_attempt.js',
+    originalContent: '',
+    stagedContent: '// unverified staged code',
+    diffPatch: '+ // unverified staged code',
+    projectPath: process.cwd()
+  });
+  assert.strictEqual(staged.status, 'PENDING');
+
+  // Attempt direct illegal bypass via updateTask: IMPLEMENT -> COMMITTED
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.COMMITTED });
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('Invalid FSM transition: cannot transition from IMPLEMENT to COMMITTED'),
+        `Expected Invalid FSM transition error, got: ${err.message}`
+      );
+      return true;
+    }
+  );
+
+  // Verify task phase is still IMPLEMENT and diff is still PENDING
+  const taskAfter = await KruschStateManager.getTask(taskId);
+  assert.strictEqual(taskAfter.phase, HARNESS_PHASES.IMPLEMENT, 'Task phase must remain IMPLEMENT');
+
+  // Clean up
+  await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.ABORTED });
+});
+
 test.after(async () => {
   await pool.end();
 });

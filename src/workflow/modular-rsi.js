@@ -1,7 +1,8 @@
 /**
- * Modular Recursive Self-Improvement (ModularRSI)
+ * Actionable Failure Attribution & Targeted Remediation (Modular Diagnostics)
  * Decomposes agent trajectory and verification failures into 5 modular components,
  * providing structured error attribution and targeted repair instructions.
+ * (Historically referenced as ModularRSI in Krusch research notes).
  */
 
 export const RSI_MODULES = {
@@ -19,7 +20,7 @@ export const RSI_ACTION_TYPES = {
   ESCALATE_TIER_OR_ABORT: 'ESCALATE_TIER_OR_ABORT'
 };
 
-export class KruschModularRSI {
+export class KruschFailureClassifier {
   /**
    * Attribute a test or verification failure to a specific harness module.
    */
@@ -89,3 +90,6 @@ export class KruschModularRSI {
     };
   }
 }
+
+// Backward-compatible alias for existing imports and types
+export const KruschModularRSI = KruschFailureClassifier;

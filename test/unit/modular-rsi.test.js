@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { KruschModularRSI, RSI_MODULES } from '../../src/workflow/modular-rsi.js';
+import { KruschModularRSI, KruschFailureClassifier, RSI_MODULES } from '../../src/workflow/modular-rsi.js';
 
 test('KruschModularRSI: attributes missing module to ContextManagement', () => {
   const testRun = {
@@ -33,4 +33,10 @@ test('KruschModularRSI: attributes assertion failure to ObservationManagement', 
   const attr = KruschModularRSI.attributeFailure(testRun);
   assert.strictEqual(attr.module, RSI_MODULES.OBSERVATION_MGMT);
   assert.ok(attr.diagnosis.includes('mismatch'));
+});
+
+test('KruschFailureClassifier: alias provides identical classification API', () => {
+  assert.strictEqual(KruschFailureClassifier, KruschModularRSI);
+  const attr = KruschFailureClassifier.attributeFailure({ stderr: 'cannot find module "foo"' });
+  assert.strictEqual(attr.module, RSI_MODULES.CONTEXT_MGMT);
 });
