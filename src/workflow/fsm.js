@@ -6,6 +6,7 @@
  * - Read-only PLAN -> COMMITTED shortcut is strictly blocked if staged diffs exist.
  */
 
+import { query } from '../brain/pool.js';
 import { KruschStateManager } from '../brain/state-manager.js';
 
 export const HARNESS_PHASES = {
@@ -28,10 +29,48 @@ export const ALLOWED_TRANSITIONS = {
   [HARNESS_PHASES.ABORTED]: []
 };
 
+let cachedDbTransitions = null;
+
 export class KruschFSM {
   constructor(taskId, initialPhase = HARNESS_PHASES.INIT) {
     this.taskId = taskId;
     this._cachedPhase = initialPhase;
+  }
+
+  /**
+   * Synchronize legal state machine transitions directly from PostgreSQL catalog table krusch_phase_edges.
+   * Guarantees a single authoritative representation of the legal transition graph.
+   */
+  static async loadAllowedTransitions(client = null) {
+    try {
+      const sql = 'SELECT from_phase, to_phase FROM krusch_phase_edges ORDER BY from_phase, to_phase';
+      const res = client ? await client.query(sql) : await query(sql);
+      if (res && res.rows && res.rows.length > 0) {
+        const graph = {
+          [HARNESS_PHASES.INIT]: [],
+          [HARNESS_PHASES.PLAN]: [],
+          [HARNESS_PHASES.IMPLEMENT]: [],
+          [HARNESS_PHASES.VERIFY]: [],
+          [HARNESS_PHASES.APPROVAL_GATE]: [],
+          [HARNESS_PHASES.COMMITTED]: [],
+          [HARNESS_PHASES.ABORTED]: []
+        };
+        for (const row of res.rows) {
+          if (!graph[row.from_phase]) graph[row.from_phase] = [];
+          graph[row.from_phase].push(row.to_phase);
+        }
+        cachedDbTransitions = graph;
+        return cachedDbTransitions;
+      }
+    } catch (_) {}
+    return ALLOWED_TRANSITIONS;
+  }
+
+  /**
+   * Get the current allowed transition graph (DB catalog or bootstrap fallback).
+   */
+  static getAllowedTransitions() {
+    return cachedDbTransitions || ALLOWED_TRANSITIONS;
   }
 
   get currentPhase() {
@@ -58,7 +97,8 @@ export class KruschFSM {
    */
   canTransitionTo(targetPhase, fromPhase = null) {
     const source = fromPhase || this._cachedPhase;
-    const allowed = ALLOWED_TRANSITIONS[source] || [];
+    const transitions = KruschFSM.getAllowedTransitions();
+    const allowed = transitions[source] || [];
     return allowed.includes(targetPhase);
   }
 
@@ -67,12 +107,17 @@ export class KruschFSM {
    * Hard invariant guards are evaluated inside the transaction before state mutation.
    */
   async transitionTo(targetPhase, metadata = {}) {
-    // 1. Fetch current authoritative DB phase if possible
+    if (!cachedDbTransitions) {
+      await KruschFSM.loadAllowedTransitions();
+    }
+
+    // 1. Fetch current authoritative DB phase
     await this.syncPhase();
 
-    if (!this.canTransitionTo(targetPhase, this._cachedPhase)) {
+    const allowed = KruschFSM.getAllowedTransitions()[this._cachedPhase] || [];
+    if (!allowed.includes(targetPhase)) {
       throw new Error(
-        `Invalid FSM transition: cannot transition from ${this._cachedPhase} to ${targetPhase}. Valid target states: [${(ALLOWED_TRANSITIONS[this._cachedPhase] || []).join(', ')}]`
+        `Invalid FSM transition: cannot transition from ${this._cachedPhase} to ${targetPhase}. Valid target states: [${allowed.join(', ')}]`
       );
     }
 
@@ -80,7 +125,7 @@ export class KruschFSM {
     const result = await KruschStateManager.atomicTransitionPhase(
       this.taskId,
       targetPhase,
-      ALLOWED_TRANSITIONS[this._cachedPhase] ? [this._cachedPhase] : [],
+      [this._cachedPhase],
       async ({ task, client }) => {
         // INVARIANT GUARD 1: VERIFY -> APPROVAL_GATE
         // Requires that verification tests ran and the TRUE LATEST run passed!

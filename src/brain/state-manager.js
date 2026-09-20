@@ -1,5 +1,56 @@
+import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
 import { query, withTransaction } from './pool.js';
+
+/**
+ * Canonicalize project_path and file_path to guarantee consistent lease keys
+ * regardless of path formatting (e.g. ./src/a.js vs src/a.js vs /abs/repo/src/a.js vs case-folding/symlinks).
+ */
+export function canonicalizePaths(projectPath, filePath) {
+  let resolvedProject = projectPath ? path.resolve(projectPath) : process.cwd();
+  if (fs.existsSync(resolvedProject)) {
+    try {
+      resolvedProject = fs.realpathSync.native(resolvedProject);
+    } catch (_) {
+      resolvedProject = fs.realpathSync(resolvedProject);
+    }
+  }
+
+  let absoluteFilePath = path.isAbsolute(filePath)
+    ? path.resolve(filePath)
+    : path.resolve(resolvedProject, filePath);
+
+  if (fs.existsSync(absoluteFilePath)) {
+    try {
+      absoluteFilePath = fs.realpathSync.native(absoluteFilePath);
+    } catch (_) {
+      absoluteFilePath = fs.realpathSync(absoluteFilePath);
+    }
+  } else {
+    const parentDir = path.dirname(absoluteFilePath);
+    if (fs.existsSync(parentDir)) {
+      try {
+        const canonicalParent = fs.realpathSync.native(parentDir);
+        absoluteFilePath = path.join(canonicalParent, path.basename(absoluteFilePath));
+      } catch (_) {}
+    }
+  }
+
+  let relativeFilePath = path.relative(resolvedProject, absoluteFilePath);
+  let normalizedFilePath;
+  if (!relativeFilePath.startsWith('..') && !path.isAbsolute(relativeFilePath)) {
+    normalizedFilePath = relativeFilePath.split(path.sep).join('/');
+  } else {
+    normalizedFilePath = absoluteFilePath.split(path.sep).join('/');
+  }
+
+  // Strip leading ./ if present
+  normalizedFilePath = normalizedFilePath.replace(/^(\.\/)+/, '');
+
+  const canonicalProjectPath = resolvedProject.split(path.sep).join('/');
+  return { projectPath: canonicalProjectPath, filePath: normalizedFilePath };
+}
 
 export class KruschStateManager {
   /**
@@ -124,15 +175,25 @@ export class KruschStateManager {
       targetProjectPath = taskRes.rows[0]?.project_path || process.cwd();
     }
 
-    // Check for existing pending diff lease on this file in this project
+    // Canonicalize paths to ensure single-writer lease consistency
+    const canonical = canonicalizePaths(targetProjectPath, filePath);
+    targetProjectPath = canonical.projectPath;
+    const canonicalFilePath = canonical.filePath;
+
+    // Check for existing active diff lease on this file in this project (PENDING or APPLIED)
     const existingRes = await query(
-      `SELECT id, task_id FROM krusch_staged_diffs WHERE project_path = $1 AND file_path = $2 AND status = 'PENDING'`,
-      [targetProjectPath, filePath]
+      `SELECT id, task_id, status FROM krusch_staged_diffs WHERE project_path = $1 AND file_path = $2 AND status IN ('PENDING', 'APPLIED')`,
+      [targetProjectPath, canonicalFilePath]
     );
 
     if (existingRes.rows.length > 0) {
       const existing = existingRes.rows[0];
       if (existing.task_id === taskId) {
+        if (existing.status === 'APPLIED') {
+          throw new Error(
+            `CONCURRENCY_LEASE_CONFLICT: File '${canonicalFilePath}' has already been APPLIED by task '${taskId}'. Staged modifications cannot overwrite applied state without explicit rollback or abort.`
+          );
+        }
         // Same task updating its staged diff
         const updateSql = `
           UPDATE krusch_staged_diffs
@@ -145,7 +206,7 @@ export class KruschStateManager {
       } else {
         // Different task holds the lease
         throw new Error(
-          `CONCURRENCY_LEASE_CONFLICT: File '${filePath}' is currently staged by pending task '${existing.task_id}'. Cannot stage concurrent modification.`
+          `CONCURRENCY_LEASE_CONFLICT: File '${canonicalFilePath}' is currently held under ${existing.status} lease by task '${existing.task_id}'. Cannot stage concurrent modification.`
         );
       }
     }
@@ -155,7 +216,7 @@ export class KruschStateManager {
       VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7, $8, NOW())
       RETURNING *;
     `;
-    const res = await query(sql, [taskId, targetProjectPath, filePath, originalContent, stagedContent, diffPatch, hash, originalHash]);
+    const res = await query(sql, [taskId, targetProjectPath, canonicalFilePath, originalContent, stagedContent, diffPatch, hash, originalHash]);
     return res.rows[0];
   }
 
@@ -164,6 +225,15 @@ export class KruschStateManager {
    */
   static async getPendingDiffs(taskId) {
     const sql = `SELECT * FROM krusch_staged_diffs WHERE task_id = $1 AND status = 'PENDING' ORDER BY id ASC`;
+    const res = await query(sql, [taskId]);
+    return res.rows;
+  }
+
+  /**
+   * Get all active (PENDING or APPLIED) staged diffs for a task.
+   */
+  static async getActiveDiffs(taskId) {
+    const sql = `SELECT * FROM krusch_staged_diffs WHERE task_id = $1 AND status IN ('PENDING', 'APPLIED') ORDER BY id ASC`;
     const res = await query(sql, [taskId]);
     return res.rows;
   }
@@ -211,16 +281,18 @@ export class KruschStateManager {
 
   /**
    * Record ground-truth test/verification execution.
+   * Locks the parent task row with SELECT ... FOR UPDATE inside a transaction
+   * to serialize concurrent runners and prevent race conditions with phase transitions.
    */
-  static async recordVerificationRun(taskId, { command, exitCode, stdout, stderr, passed, failureModule = null, extractedErrors = [] }) {
-    const sql = `
+  static async recordVerificationRun(taskId, { command, exitCode, stdout, stderr, passed, failureModule = null, extractedErrors = [] }, client = null) {
+    const insertSql = `
       INSERT INTO krusch_verification_runs (
         task_id, command, exit_code, stdout, stderr, passed, failure_module, extracted_errors, created_at
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
       RETURNING *;
     `;
-    const res = await query(sql, [
+    const params = [
       taskId,
       command,
       exitCode,
@@ -228,9 +300,21 @@ export class KruschStateManager {
       stderr,
       passed,
       failureModule,
-      JSON.stringify(extractedErrors)
-    ]);
-    return res.rows[0];
+      JSON.stringify(extractedErrors || [])
+    ];
+
+    if (client) {
+      // Lock parent task row to serialize concurrent verification runners
+      await client.query('SELECT id FROM krusch_tasks WHERE id = $1 FOR UPDATE', [taskId]);
+      const res = await client.query(insertSql, params);
+      return res.rows[0];
+    } else {
+      return await withTransaction(async (txClient) => {
+        await txClient.query('SELECT id FROM krusch_tasks WHERE id = $1 FOR UPDATE', [taskId]);
+        const res = await txClient.query(insertSql, params);
+        return res.rows[0];
+      });
+    }
   }
 
   /**
@@ -274,6 +358,106 @@ export class KruschStateManager {
   }
 
   /**
+   * Atomically record verification run and transition task phase under a single unbroken task row lock.
+   */
+  static async recordVerificationAndTransition(taskId, verifData, targetPhase = null, metadata = {}) {
+    return await withTransaction(async (client) => {
+      // 1. Lock task row in PostgreSQL (FOR UPDATE)
+      const taskRes = await client.query('SELECT * FROM krusch_tasks WHERE id = $1 FOR UPDATE', [taskId]);
+      if (taskRes.rows.length === 0) {
+        throw new Error(`Task '${taskId}' not found for verification run.`);
+      }
+
+      // 2. Insert verification run under the row lock
+      const insertSql = `
+        INSERT INTO krusch_verification_runs (
+          task_id, command, exit_code, stdout, stderr, passed, failure_module, extracted_errors, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        RETURNING *;
+      `;
+      const runRes = await client.query(insertSql, [
+        taskId,
+        verifData.command,
+        verifData.exitCode,
+        verifData.stdout,
+        verifData.stderr,
+        verifData.passed,
+        verifData.failureModule || null,
+        JSON.stringify(verifData.extractedErrors || [])
+      ]);
+
+      let transitionResult = null;
+      if (targetPhase) {
+        transitionResult = await KruschStateManager._executeTransitionInsideTransaction(
+          client,
+          taskRes.rows[0],
+          targetPhase,
+          [],
+          null,
+          metadata
+        );
+      }
+
+      return {
+        verificationRun: runRes.rows[0],
+        transition: transitionResult
+      };
+    });
+  }
+
+  /**
+   * Helper to perform phase transition logic inside an already-open transaction with row locked.
+   * @private
+   */
+  static async _executeTransitionInsideTransaction(client, task, targetPhase, allowedSourcePhases = [], guardValidator = null, metadata = {}) {
+    const currentPhase = task.phase;
+
+    // Validate allowed transitions from the authoritative DB phase
+    if (allowedSourcePhases.length > 0 && !allowedSourcePhases.includes(currentPhase)) {
+      throw new Error(
+        `Invalid FSM transition: cannot transition from ${currentPhase} to ${targetPhase}. Valid target states from ${currentPhase}: [${allowedSourcePhases.join(', ')}]`
+      );
+    }
+
+    // Execute transactional guard validator
+    if (guardValidator) {
+      await guardValidator({ task, client, targetPhase });
+    }
+
+    // Update phase and metadata in PostgreSQL
+    const updatedMetadata = {
+      ...(task.metadata || {}),
+      ...metadata,
+      lastTransition: {
+        from: currentPhase,
+        to: targetPhase,
+        timestamp: new Date().toISOString()
+      }
+    };
+
+    const updateSql = `
+      UPDATE krusch_tasks
+      SET phase = $1, metadata = $2, updated_at = NOW()
+      WHERE id = $3
+      RETURNING *;
+    `;
+    const updateRes = await client.query(updateSql, [targetPhase, JSON.stringify(updatedMetadata), task.id]);
+
+    // Log transition event in krusch_events
+    await client.query(`
+      INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+      VALUES ($1, NULL, 'fsm_phase_transition', $2, NOW())
+    `, [task.id, JSON.stringify({ from: currentPhase, to: targetPhase, metadata })]);
+
+    return {
+      from: currentPhase,
+      to: targetPhase,
+      task: updateRes.rows[0]
+    };
+  }
+
+  /**
    * Atomically transition a task's FSM phase inside PostgreSQL using row-level locking.
    * Prevents multi-process drift and guarantees invariant validation before write.
    */
@@ -285,51 +469,14 @@ export class KruschStateManager {
         throw new Error(`Task '${taskId}' not found for atomic transition.`);
       }
 
-      const task = taskRes.rows[0];
-      const currentPhase = task.phase;
-
-      // 2. Validate allowed transitions from the authoritative DB phase
-      if (allowedSourcePhases.length > 0 && !allowedSourcePhases.includes(currentPhase)) {
-        throw new Error(
-          `Invalid FSM transition: cannot transition from ${currentPhase} to ${targetPhase}. Valid target states from ${currentPhase}: [${allowedSourcePhases.join(', ')}]`
-        );
-      }
-
-      // 3. Execute transactional guard validator
-      if (guardValidator) {
-        await guardValidator({ task, client, targetPhase });
-      }
-
-      // 4. Update phase and metadata in PostgreSQL
-      const updatedMetadata = {
-        ...(task.metadata || {}),
-        ...metadata,
-        lastTransition: {
-          from: currentPhase,
-          to: targetPhase,
-          timestamp: new Date().toISOString()
-        }
-      };
-
-      const updateSql = `
-        UPDATE krusch_tasks
-        SET phase = $1, metadata = $2, updated_at = NOW()
-        WHERE id = $3
-        RETURNING *;
-      `;
-      const updateRes = await client.query(updateSql, [targetPhase, JSON.stringify(updatedMetadata), taskId]);
-
-      // 5. Log transition event in krusch_events
-      await client.query(`
-        INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
-        VALUES ($1, NULL, 'fsm_phase_transition', $2, NOW())
-      `, [taskId, JSON.stringify({ from: currentPhase, to: targetPhase, metadata })]);
-
-      return {
-        from: currentPhase,
-        to: targetPhase,
-        task: updateRes.rows[0]
-      };
+      return await KruschStateManager._executeTransitionInsideTransaction(
+        client,
+        taskRes.rows[0],
+        targetPhase,
+        allowedSourcePhases,
+        guardValidator,
+        metadata
+      );
     });
   }
 }

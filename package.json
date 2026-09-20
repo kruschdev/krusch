@@ -20,10 +20,8 @@
     "coding-harness",
     "agentic-ai",
     "postgres",
-    "pgvector",
     "llm-router",
     "cascade",
-    "dbos",
     "mcp"
   ],
   "author": "Kevin Ruschman (KruschDev)",

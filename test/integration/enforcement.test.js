@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { pool, query } from '../../src/brain/pool.js';
-import { KruschStateManager } from '../../src/brain/state-manager.js';
+import { KruschStateManager, canonicalizePaths } from '../../src/brain/state-manager.js';
 import { KruschFSM, HARNESS_PHASES } from '../../src/workflow/fsm.js';
 import { KruschTools } from '../../src/tools/index.js';
 
@@ -601,6 +601,7 @@ test('Enforcement: Single-writer file concurrency lease prevents concurrent conf
     (err) => {
       assert.ok(
         err.message.includes('CONCURRENCY_LEASE_CONFLICT') ||
+        err.message.includes('idx_krusch_staged_diffs_project_file_active') ||
         err.message.includes('idx_krusch_staged_diffs_project_file_pending')
       );
       return true;
@@ -617,7 +618,11 @@ test('Enforcement: Single-writer file concurrency lease prevents concurrent conf
       );
     },
     (err) => {
-      assert.ok(err.message.includes('idx_krusch_staged_diffs_project_file_pending'));
+      assert.ok(
+        err.message.includes('idx_krusch_staged_diffs_project_file_active') ||
+        err.message.includes('idx_krusch_staged_diffs_project_file_pending') ||
+        err.message.includes('duplicate key value')
+      );
       return true;
     }
   );
@@ -672,6 +677,303 @@ test('Enforcement: Versioned migration catalog tracks applied migrations', async
   const versions = res.rows.map(r => r.version);
   assert.ok(versions.includes('001_initial_schema'));
   assert.ok(versions.includes('002_harden_invariants'));
+  assert.ok(versions.includes('003_phase_edges_and_lease_hardening'));
+});
+
+test('Enforcement: Path canonicalization prevents lease bypass across relative, absolute, and dot-dot spellings', async () => {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-canon-test-'));
+  const subDir = path.join(testDir, 'src', 'modules');
+  fs.mkdirSync(subDir, { recursive: true });
+
+  const task1 = `canon_task_1_${Date.now()}`;
+  const task2 = `canon_task_2_${Date.now()}`;
+  const task3 = `canon_task_3_${Date.now()}`;
+
+  await KruschStateManager.createTask({
+    id: task1,
+    goal: 'Canonicalization Test Task 1',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  await KruschStateManager.createTask({
+    id: task2,
+    goal: 'Canonicalization Test Task 2',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  await KruschStateManager.createTask({
+    id: task3,
+    goal: 'Canonicalization Test Task 3',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  // Task 1 stages using relative path with dot-slash: './src/modules/index.js'
+  const staged1 = await KruschStateManager.stageDiff(task1, {
+    filePath: './src/modules/index.js',
+    originalContent: '',
+    stagedContent: 'console.log("task 1");',
+    diffPatch: 'add file',
+    projectPath: testDir
+  });
+  assert.strictEqual(staged1.file_path, 'src/modules/index.js', 'File path must be normalized without leading ./');
+
+  // Task 2 attempts to stage using clean relative path: 'src/modules/index.js' -> MUST FAIL
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.stageDiff(task2, {
+        filePath: 'src/modules/index.js',
+        originalContent: '',
+        stagedContent: 'console.log("task 2 collision");',
+        diffPatch: 'task 2',
+        projectPath: testDir
+      });
+    },
+    (err) => {
+      assert.ok(err.message.includes('CONCURRENCY_LEASE_CONFLICT'));
+      return true;
+    }
+  );
+
+  // Task 2 attempts to stage using absolute path: path.join(testDir, 'src/modules/index.js') -> MUST FAIL
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.stageDiff(task2, {
+        filePath: path.join(testDir, 'src', 'modules', 'index.js'),
+        originalContent: '',
+        stagedContent: 'console.log("task 2 absolute collision");',
+        diffPatch: 'task 2 abs',
+        projectPath: testDir
+      });
+    },
+    (err) => {
+      assert.ok(err.message.includes('CONCURRENCY_LEASE_CONFLICT'));
+      return true;
+    }
+  );
+
+  // Task 2 attempts to stage using dot-dot path: 'src/../src/modules/index.js' -> MUST FAIL
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.stageDiff(task2, {
+        filePath: 'src/../src/modules/index.js',
+        originalContent: '',
+        stagedContent: 'console.log("task 2 dot-dot collision");',
+        diffPatch: 'task 2 dot-dot',
+        projectPath: testDir
+      });
+    },
+    (err) => {
+      assert.ok(err.message.includes('CONCURRENCY_LEASE_CONFLICT'));
+      return true;
+    }
+  );
+
+  // Direct SQL insert with raw non-canonical path into PostgreSQL trigger: trigger normalizes and rejects via unique index
+  await assert.rejects(
+    async () => {
+      await query(
+        `INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, staged_content, status)
+         VALUES ($1, $2, $3, $4, 'PENDING')`,
+        [task3, testDir, './src/modules/index.js', '// raw SQL']
+      );
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('idx_krusch_staged_diffs_project_file_active') ||
+        err.message.includes('duplicate key value')
+      );
+      return true;
+    }
+  );
+
+  // Abort tasks and cleanup
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, task1]);
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, task2]);
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, task3]);
+  fs.rmSync(testDir, { recursive: true, force: true });
+});
+
+test('Enforcement: Lease is held across APPLIED status through APPROVAL_GATE until COMMITTED', async () => {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-lease-active-test-'));
+  const sharedFile = 'src/service.js';
+
+  const taskA = `lease_task_a_${Date.now()}`;
+  const taskB = `lease_task_b_${Date.now()}`;
+
+  await KruschStateManager.createTask({
+    id: taskA,
+    goal: 'Task A working through lifecycle',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.VERIFY
+  });
+
+  await KruschStateManager.createTask({
+    id: taskB,
+    goal: 'Task B waiting for publication',
+    projectPath: testDir,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  // Task A stages file
+  const stagedA = await KruschStateManager.stageDiff(taskA, {
+    filePath: sharedFile,
+    originalContent: '',
+    stagedContent: 'export const service = "A";',
+    diffPatch: 'Task A staged',
+    projectPath: testDir
+  });
+
+  // Task A passes verification and moves to APPROVAL_GATE
+  await KruschStateManager.recordVerificationRun(taskA, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'OK',
+    stderr: '',
+    passed: true
+  });
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.APPROVAL_GATE, taskA]);
+
+  // Task A applies staged diff to disk -> status becomes APPLIED
+  await KruschStateManager.updateDiffStatus(stagedA.id, 'APPLIED');
+  const appliedCheck = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [stagedA.id]);
+  assert.strictEqual(appliedCheck.rows[0].status, 'APPLIED');
+
+  // Task B attempts to stage the same file while Task A is still in APPROVAL_GATE: MUST BE BLOCKED!
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.stageDiff(taskB, {
+        filePath: sharedFile,
+        originalContent: '',
+        stagedContent: 'export const service = "B";',
+        diffPatch: 'Task B attempting collision',
+        projectPath: testDir
+      });
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('CONCURRENCY_LEASE_CONFLICT') ||
+        err.message.includes('idx_krusch_staged_diffs_project_file_active')
+      );
+      return true;
+    }
+  );
+
+  // Raw SQL from Task B while status is APPLIED must also be blocked by PostgreSQL index
+  await assert.rejects(
+    async () => {
+      await query(
+        `INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, staged_content, status)
+         VALUES ($1, $2, $3, $4, 'PENDING')`,
+        [taskB, testDir, sharedFile, 'conflict']
+      );
+    },
+    (err) => {
+      assert.ok(err.message.includes('idx_krusch_staged_diffs_project_file_active'));
+      return true;
+    }
+  );
+
+  // Task A transitions to COMMITTED: database trigger automatically updates status to COMMITTED, releasing lease!
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskA]);
+  const committedCheck = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [stagedA.id]);
+  assert.strictEqual(committedCheck.rows[0].status, 'COMMITTED', 'Diff status must automatically promote to COMMITTED upon task commit');
+
+  // Task B can now successfully stage the file!
+  const stagedB = await KruschStateManager.stageDiff(taskB, {
+    filePath: sharedFile,
+    originalContent: 'export const service = "A";',
+    stagedContent: 'export const service = "B";',
+    diffPatch: 'Task B now succeeds',
+    projectPath: testDir
+  });
+  assert.strictEqual(stagedB.status, 'PENDING');
+
+  // Clean up
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskB]);
+  fs.rmSync(testDir, { recursive: true, force: true });
+});
+
+test('Enforcement: Single source of truth for legal graph via krusch_phase_edges', async () => {
+  // Query edges directly from PostgreSQL catalog table
+  const dbEdges = await query('SELECT from_phase, to_phase FROM krusch_phase_edges ORDER BY from_phase, to_phase');
+  assert.ok(dbEdges.rows.length >= 13);
+
+  // Verify KruschFSM loads edges dynamically
+  const loadedGraph = await KruschFSM.loadAllowedTransitions();
+  assert.ok(loadedGraph[HARNESS_PHASES.INIT].includes(HARNESS_PHASES.PLAN));
+  assert.ok(loadedGraph[HARNESS_PHASES.PLAN].includes(HARNESS_PHASES.IMPLEMENT));
+  assert.ok(loadedGraph[HARNESS_PHASES.VERIFY].includes(HARNESS_PHASES.APPROVAL_GATE));
+  assert.ok(loadedGraph[HARNESS_PHASES.APPROVAL_GATE].includes(HARNESS_PHASES.COMMITTED));
+
+  // Verify that an invalid edge not in krusch_phase_edges is rejected by both JS and DB trigger
+  const taskId = `edge_test_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test graph edge rejection',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.INIT
+  });
+
+  const fsm = new KruschFSM(taskId, HARNESS_PHASES.INIT);
+  assert.strictEqual(fsm.canTransitionTo(HARNESS_PHASES.COMMITTED), false);
+
+  // Attempt transition via raw SQL: trigger rejects consulting krusch_phase_edges
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('Invalid FSM transition'));
+      return true;
+    }
+  );
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+});
+
+test('Enforcement: Task row locking serializes concurrent verification runs and phase transitions', async () => {
+  const taskId = `lock_task_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Task row locking test',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.VERIFY
+  });
+
+  // Verify recordVerificationRun executes with row lock
+  const run1 = await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'Tests passed',
+    stderr: '',
+    passed: true
+  });
+  assert.strictEqual(run1.passed, true);
+
+  // Verify recordVerificationAndTransition atomically records test and transitions phase
+  const runAndTransition = await KruschStateManager.recordVerificationAndTransition(
+    taskId,
+    {
+      command: 'npm test',
+      exitCode: 0,
+      stdout: 'All green',
+      stderr: '',
+      passed: true
+    },
+    HARNESS_PHASES.APPROVAL_GATE,
+    { verifiedBy: 'atomic_runner' }
+  );
+
+  assert.strictEqual(runAndTransition.verificationRun.passed, true);
+  assert.strictEqual(runAndTransition.transition.to, HARNESS_PHASES.APPROVAL_GATE);
+
+  const updatedTask = await KruschStateManager.getTask(taskId);
+  assert.strictEqual(updatedTask.phase, HARNESS_PHASES.APPROVAL_GATE);
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
 });
 
 test.after(async () => {

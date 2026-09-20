@@ -42,10 +42,23 @@ CREATE TRIGGER trg_set_krusch_staged_diff_project_path
     FOR EACH ROW
     EXECUTE FUNCTION set_krusch_staged_diff_project_path();
 
--- Resolve legacy pending diffs before creating unique index
-UPDATE krusch_staged_diffs
-SET status = 'REJECTED'
-WHERE status = 'PENDING';
+-- Verify no duplicate pending diffs exist before creating unique index; fail loudly if conflicts found
+DO $$
+DECLARE
+    v_conflicts TEXT;
+BEGIN
+    SELECT string_agg(project_path || ':' || file_path, ', ')
+    INTO v_conflicts
+    FROM krusch_staged_diffs
+    WHERE status = 'PENDING'
+    GROUP BY project_path, file_path
+    HAVING COUNT(*) > 1;
+
+    IF v_conflicts IS NOT NULL THEN
+        RAISE EXCEPTION 'Cannot create unique index: duplicate PENDING staged diffs exist for (%). Resolve manually before migrating.', v_conflicts
+            USING ERRCODE = 'check_violation';
+    END IF;
+END $$;
 
 -- 3. Unique partial index enforcing single-writer lease per file per project
 CREATE UNIQUE INDEX IF NOT EXISTS idx_krusch_staged_diffs_project_file_pending

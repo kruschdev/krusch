@@ -172,11 +172,11 @@ krusch/
 ├── bin/
 │   └── krusch.js               # CLI binary entry point
 ├── db/
-│   ├── schema.sql              # Consolidated schema reference
-│   ├── migrate.js              # Versioned migration runner
+│   ├── migrate.js              # Versioned transactional migration runner
 │   └── migrations/             # Sequential migration files
 │       ├── 001_initial_schema.sql
-│       └── 002_harden_invariants.sql
+│       ├── 002_harden_invariants.sql
+│       └── 003_phase_edges_and_lease_hardening.sql
 ├── src/
 │   ├── brain/
 │   │   ├── pool.js             # Resilient PostgreSQL connection pool

@@ -51,11 +51,16 @@ export interface StagedDiffRecord {
   original_content: string | null;
   staged_content: string;
   diff_patch: string | null;
-  status: 'PENDING' | 'APPLIED' | 'REJECTED';
+  status: 'PENDING' | 'APPLIED' | 'COMMITTED' | 'REJECTED';
   sha256_hash: string;
   original_sha256: string | null;
   created_at: string;
   applied_at: string | null;
+}
+
+export interface KruschPhaseEdge {
+  from_phase: HarnessPhase;
+  to_phase: HarnessPhase;
 }
 
 export interface ApprovalRecord {
@@ -83,10 +88,14 @@ export interface VerificationRunRecord {
   created_at: string;
 }
 
+export function canonicalizePaths(projectPath: string, filePath: string): { projectPath: string; filePath: string };
+
 export class KruschFSM {
   taskId: string;
   currentPhase: HarnessPhase;
   constructor(taskId: string, initialPhase?: HarnessPhase);
+  static loadAllowedTransitions(client?: any): Promise<Record<HarnessPhase, HarnessPhase[]>>;
+  static getAllowedTransitions(): Record<HarnessPhase, HarnessPhase[]>;
   syncPhase(): Promise<HarnessPhase>;
   canTransitionTo(targetPhase: HarnessPhase, fromPhase?: HarnessPhase | null): boolean;
   transitionTo(targetPhase: HarnessPhase, metadata?: Record<string, any>): Promise<{ from: HarnessPhase; to: HarnessPhase }>;
@@ -138,7 +147,9 @@ export class KruschStateManager {
 
   static getPendingDiffs(taskId: string): Promise<StagedDiffRecord[]>;
 
-  static updateDiffStatus(diffId: number, status: 'PENDING' | 'APPLIED' | 'REJECTED'): Promise<StagedDiffRecord>;
+  static getActiveDiffs(taskId: string): Promise<StagedDiffRecord[]>;
+
+  static updateDiffStatus(diffId: number, status: 'PENDING' | 'APPLIED' | 'COMMITTED' | 'REJECTED'): Promise<StagedDiffRecord>;
 
   static requestApproval(
     taskId: string,
@@ -163,8 +174,24 @@ export class KruschStateManager {
       passed: boolean;
       failureModule?: string | null;
       extractedErrors?: any[];
-    }
+    },
+    client?: any
   ): Promise<VerificationRunRecord>;
+
+  static recordVerificationAndTransition(
+    taskId: string,
+    verifData: {
+      command: string;
+      exitCode: number;
+      stdout: string;
+      stderr: string;
+      passed: boolean;
+      failureModule?: string | null;
+      extractedErrors?: any[];
+    },
+    targetPhase?: HarnessPhase | null,
+    metadata?: Record<string, any>
+  ): Promise<{ verificationRun: VerificationRunRecord; transition: any }>;
 
   static getLatestVerificationRun(taskId: string, client?: any): Promise<VerificationRunRecord | null>;
 

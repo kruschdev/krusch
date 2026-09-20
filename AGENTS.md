@@ -30,7 +30,7 @@
 - `npm test`: Run full test suite (unit + PostgreSQL integration).
 - `npm run test:unit`: Fast unit tests (router, normalizer, trajectory guard, modular-rsi).
 - `npm run test:integration`: PostgreSQL lifecycle integration tests.
-- `npm run migrate`: Apply `db/schema.sql` to PostgreSQL (`kdcode`).
+- `npm run migrate`: Apply versioned migrations from `db/migrations/` to PostgreSQL (`kdcode`).
 - `./bin/krusch.js run "<goal>"`: Run CLI harness.
 - `./bin/krusch.js route "<prompt>"`: Test cascade routing decision.
 - `./bin/krusch.js mcp`: Run stdio MCP server.

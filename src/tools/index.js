@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { KruschStateManager } from '../brain/state-manager.js';
+import { KruschStateManager, canonicalizePaths } from '../brain/state-manager.js';
 import { KruschContextClient } from '../brain/context-client.js';
 import { KruschTestRunner } from '../verify/test-runner.js';
 import { KruschApprovalPolicy } from '../approvals/policy.js';
@@ -94,19 +94,22 @@ export class KruschTools {
     }
 
     if (name === 'read_file') {
-      const fullPath = path.resolve(this.projectPath, args.path);
+      const { projectPath, filePath } = canonicalizePaths(this.projectPath, args.path);
+      const fullPath = path.resolve(projectPath, filePath);
       if (!fs.existsSync(fullPath)) {
         return { error: `File not found: ${args.path}` };
       }
       const content = fs.readFileSync(fullPath, 'utf-8');
-      return { path: args.path, content };
+      return { path: filePath, content };
     }
 
     if (name === 'stage_diff') {
-      const fullPath = path.resolve(this.projectPath, args.path);
+      const { projectPath, filePath } = canonicalizePaths(this.projectPath, args.path);
+      const fullPath = path.resolve(projectPath, filePath);
       const originalContent = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
       const stagedRow = await KruschStateManager.stageDiff(this.taskId, {
         filePath: args.path,
+        projectPath: this.projectPath,
         originalContent,
         stagedContent: args.content,
         diffPatch: args.explanation || 'Staged modification'
@@ -114,7 +117,7 @@ export class KruschTools {
       return {
         status: 'STAGED',
         diffId: stagedRow.id,
-        filePath: args.path,
+        filePath: stagedRow.file_path,
         hash: stagedRow.sha256_hash,
         message: `Changes staged in PostgreSQL (ID: ${stagedRow.id}). Ready for verification.`
       };
@@ -166,7 +169,8 @@ export class KruschTools {
         return { error: `Pending diff with ID ${args.diffId} not found.` };
       }
 
-      const fullPath = path.resolve(this.projectPath, target.file_path);
+      const { projectPath, filePath } = canonicalizePaths(this.projectPath, target.file_path);
+      const fullPath = path.resolve(projectPath, filePath);
       const targetDir = path.dirname(fullPath);
       fs.mkdirSync(targetDir, { recursive: true });
 
