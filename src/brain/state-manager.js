@@ -59,7 +59,7 @@ export class KruschStateManager {
     const turnsRes = await query('SELECT * FROM krusch_turns WHERE task_id = $1 ORDER BY turn_number ASC', [taskId]);
     const diffsRes = await query('SELECT * FROM krusch_staged_diffs WHERE task_id = $1 ORDER BY id ASC', [taskId]);
     const approvalsRes = await query('SELECT * FROM krusch_approvals WHERE task_id = $1 ORDER BY id ASC', [taskId]);
-    const verifRes = await query('SELECT * FROM krusch_verification_runs WHERE task_id = $1 ORDER BY id DESC', [taskId]);
+    const verifRes = await query('SELECT * FROM krusch_verification_runs WHERE task_id = $1 ORDER BY id DESC, created_at DESC', [taskId]);
 
     return {
       ...task,
@@ -135,7 +135,12 @@ export class KruschStateManager {
    * Update status of a staged diff (e.g. APPLIED, REJECTED).
    */
   static async updateDiffStatus(diffId, status) {
-    const sql = `UPDATE krusch_staged_diffs SET status = $1 WHERE id = $2 RETURNING *;`;
+    const sql = `
+      UPDATE krusch_staged_diffs
+      SET status = $1::varchar(32), applied_at = (CASE WHEN $1::text = 'APPLIED' THEN NOW() ELSE NULL END)
+      WHERE id = $2
+      RETURNING *;
+    `;
     const res = await query(sql, [status, diffId]);
     return res.rows[0];
   }
@@ -190,4 +195,105 @@ export class KruschStateManager {
     ]);
     return res.rows[0];
   }
+
+  /**
+   * Get the authoritative latest verification run for a task.
+   */
+  static async getLatestVerificationRun(taskId, client = null) {
+    const sql = `
+      SELECT * FROM krusch_verification_runs
+      WHERE task_id = $1
+      ORDER BY id DESC, created_at DESC
+      LIMIT 1;
+    `;
+    const res = client ? await client.query(sql, [taskId]) : await query(sql, [taskId]);
+    return res.rows[0] || null;
+  }
+
+  /**
+   * Check if a task has any unapplied (PENDING) staged diffs.
+   */
+  static async hasUnappliedStagedDiffs(taskId, client = null) {
+    const sql = `
+      SELECT 1 FROM krusch_staged_diffs
+      WHERE task_id = $1 AND status = 'PENDING'
+      LIMIT 1;
+    `;
+    const res = client ? await client.query(sql, [taskId]) : await query(sql, [taskId]);
+    return res.rows.length > 0;
+  }
+
+  /**
+   * Check if a task has any staged diffs at all (regardless of status).
+   */
+  static async hasAnyStagedDiffs(taskId, client = null) {
+    const sql = `
+      SELECT 1 FROM krusch_staged_diffs
+      WHERE task_id = $1
+      LIMIT 1;
+    `;
+    const res = client ? await client.query(sql, [taskId]) : await query(sql, [taskId]);
+    return res.rows.length > 0;
+  }
+
+  /**
+   * Atomically transition a task's FSM phase inside PostgreSQL using row-level locking.
+   * Prevents multi-process drift and guarantees invariant validation before write.
+   */
+  static async atomicTransitionPhase(taskId, targetPhase, allowedSourcePhases = [], guardValidator = null, metadata = {}) {
+    return await withTransaction(async (client) => {
+      // 1. Lock task row in PostgreSQL (FOR UPDATE)
+      const taskRes = await client.query('SELECT * FROM krusch_tasks WHERE id = $1 FOR UPDATE', [taskId]);
+      if (taskRes.rows.length === 0) {
+        throw new Error(`Task '${taskId}' not found for atomic transition.`);
+      }
+
+      const task = taskRes.rows[0];
+      const currentPhase = task.phase;
+
+      // 2. Validate allowed transitions from the authoritative DB phase
+      if (allowedSourcePhases.length > 0 && !allowedSourcePhases.includes(currentPhase)) {
+        throw new Error(
+          `Invalid FSM transition: cannot transition from ${currentPhase} to ${targetPhase}. Valid target states from ${currentPhase}: [${allowedSourcePhases.join(', ')}]`
+        );
+      }
+
+      // 3. Execute transactional guard validator
+      if (guardValidator) {
+        await guardValidator({ task, client, targetPhase });
+      }
+
+      // 4. Update phase and metadata in PostgreSQL
+      const updatedMetadata = {
+        ...(task.metadata || {}),
+        ...metadata,
+        lastTransition: {
+          from: currentPhase,
+          to: targetPhase,
+          timestamp: new Date().toISOString()
+        }
+      };
+
+      const updateSql = `
+        UPDATE krusch_tasks
+        SET phase = $1, metadata = $2, updated_at = NOW()
+        WHERE id = $3
+        RETURNING *;
+      `;
+      const updateRes = await client.query(updateSql, [targetPhase, JSON.stringify(updatedMetadata), taskId]);
+
+      // 5. Log transition event in krusch_events
+      await client.query(`
+        INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+        VALUES ($1, NULL, 'fsm_phase_transition', $2, NOW())
+      `, [taskId, JSON.stringify({ from: currentPhase, to: targetPhase, metadata })]);
+
+      return {
+        from: currentPhase,
+        to: targetPhase,
+        task: updateRes.rows[0]
+      };
+    });
+  }
 }
+

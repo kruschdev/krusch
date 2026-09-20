@@ -1,11 +1,11 @@
 -- PostgreSQL Schema for Krusch Coding Harness
--- Cognitive substrate for interchangeable LLMs, persistent state, and ground-truth verification.
+-- Durable state for multi-model coding agents with enforced verification invariants.
 
 CREATE TABLE IF NOT EXISTS krusch_tasks (
     id VARCHAR(64) PRIMARY KEY,
     goal TEXT NOT NULL,
     project_path TEXT NOT NULL,
-    phase VARCHAR(32) NOT NULL DEFAULT 'PLAN',
+    phase VARCHAR(32) NOT NULL DEFAULT 'PLAN' CHECK (phase IN ('INIT', 'PLAN', 'IMPLEMENT', 'VERIFY', 'APPROVAL_GATE', 'COMMITTED', 'ABORTED')),
     current_model VARCHAR(128),
     metadata JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -42,9 +42,10 @@ CREATE TABLE IF NOT EXISTS krusch_staged_diffs (
     original_content TEXT,
     staged_content TEXT NOT NULL,
     diff_patch TEXT,
-    status VARCHAR(32) DEFAULT 'PENDING', -- PENDING, APPLIED, REJECTED
+    status VARCHAR(32) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPLIED', 'REJECTED')),
     sha256_hash VARCHAR(64),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    applied_at TIMESTAMP WITH TIME ZONE
 );
 
 CREATE TABLE IF NOT EXISTS krusch_approvals (
@@ -79,3 +80,37 @@ CREATE INDEX IF NOT EXISTS idx_krusch_events_task ON krusch_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_krusch_staged_diffs_task ON krusch_staged_diffs(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_krusch_approvals_task ON krusch_approvals(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_krusch_verif_task ON krusch_verification_runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_krusch_verif_task_latest ON krusch_verification_runs(task_id, id DESC, created_at DESC);
+
+-- Ensure constraints and columns exist on previously created tables
+DO $$
+BEGIN
+    -- Normalize any legacy 'COMPLETE' phase rows to 'COMMITTED'
+    UPDATE krusch_tasks SET phase = 'COMMITTED' WHERE phase = 'COMPLETE';
+
+    -- krusch_tasks phase check constraint
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_krusch_tasks_phase'
+    ) THEN
+        ALTER TABLE krusch_tasks
+        ADD CONSTRAINT chk_krusch_tasks_phase
+        CHECK (phase IN ('INIT', 'PLAN', 'IMPLEMENT', 'VERIFY', 'APPROVAL_GATE', 'COMMITTED', 'ABORTED'));
+    END IF;
+
+    -- krusch_staged_diffs status check constraint
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_krusch_staged_diffs_status'
+    ) THEN
+        ALTER TABLE krusch_staged_diffs
+        ADD CONSTRAINT chk_krusch_staged_diffs_status
+        CHECK (status IN ('PENDING', 'APPLIED', 'REJECTED'));
+    END IF;
+
+    -- krusch_staged_diffs applied_at column
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'krusch_staged_diffs' AND column_name = 'applied_at'
+    ) THEN
+        ALTER TABLE krusch_staged_diffs ADD COLUMN applied_at TIMESTAMP WITH TIME ZONE;
+    END IF;
+END $$;

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { KruschStateManager } from '../brain/state-manager.js';
 import { KruschContextClient } from '../brain/context-client.js';
 import { KruschTestRunner } from '../verify/test-runner.js';
@@ -150,12 +151,12 @@ export class KruschTools {
         };
       }
 
-      // Hard Invariant Guard: Ground-truth tests must have passed
-      const verifs = task.verifications || [];
-      if (verifs.length > 0 && !verifs[0].passed) {
+      // Hard Invariant Guard: Ground-truth tests must have passed on true latest run
+      const latestVerif = await KruschStateManager.getLatestVerificationRun(this.taskId);
+      if (latestVerif && (!latestVerif.passed || latestVerif.exit_code !== 0)) {
         return {
           error: 'VERIFICATION_FAILED_MUTATION_BLOCKED',
-          message: `Refusing to apply staged diff to disk: ground-truth verification is failing (Exit Code: ${verifs[0].exit_code}).`
+          message: `Refusing to apply staged diff to disk: ground-truth verification is failing (Exit Code: ${latestVerif.exit_code}).`
         };
       }
 
@@ -164,11 +165,34 @@ export class KruschTools {
       if (!target) {
         return { error: `Pending diff with ID ${args.diffId} not found.` };
       }
+
       const fullPath = path.resolve(this.projectPath, target.file_path);
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, target.staged_content, 'utf-8');
-      await KruschStateManager.updateDiffStatus(target.id, 'APPLIED');
-      return { status: 'APPLIED', diffId: target.id, filePath: target.file_path };
+      const targetDir = path.dirname(fullPath);
+      fs.mkdirSync(targetDir, { recursive: true });
+
+      // Crash-Safe Atomic Apply:
+      // 1. Write staged content to sibling temporary file
+      // 2. fsync to force physical flush to storage media
+      // 3. Atomic rename replaces destination file atomically on POSIX filesystems
+      // 4. Update PostgreSQL status to APPLIED with timestamp
+      const randSuffix = crypto.randomBytes(4).toString('hex');
+      const tempPath = path.resolve(targetDir, `.${path.basename(fullPath)}.krusch-tmp-${Date.now()}-${randSuffix}`);
+
+      try {
+        const fd = fs.openSync(tempPath, 'w');
+        fs.writeSync(fd, target.staged_content);
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+
+        fs.renameSync(tempPath, fullPath);
+        await KruschStateManager.updateDiffStatus(target.id, 'APPLIED');
+        return { status: 'APPLIED', diffId: target.id, filePath: target.file_path };
+      } catch (err) {
+        if (fs.existsSync(tempPath)) {
+          try { fs.unlinkSync(tempPath); } catch (_) {}
+        }
+        return { error: `CRASH_SAFE_APPLY_FAILED: ${err.message}` };
+      }
     }
 
     return { error: `Unknown tool: ${name}` };
