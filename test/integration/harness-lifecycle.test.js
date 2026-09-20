@@ -4,6 +4,7 @@ import { pool } from '../../src/brain/pool.js';
 import { KruschStateManager } from '../../src/brain/state-manager.js';
 import { KruschStateMachine } from '../../src/workflow/state-machine.js';
 import { MockModelAdapter } from '../../src/models/providers/mock.js';
+import { HARNESS_PHASES } from '../../src/workflow/fsm.js';
 
 test('Integration: Krusch PostgreSQL state persistence and task lifecycle', async () => {
   const taskId = `test_task_${Date.now()}`;
@@ -11,12 +12,12 @@ test('Integration: Krusch PostgreSQL state persistence and task lifecycle', asyn
     id: taskId,
     goal: 'Test PostgreSQL Cognitive Substrate',
     projectPath: process.cwd(),
-    phase: 'PLAN',
+    phase: HARNESS_PHASES.PLAN,
     metadata: { test: true }
   });
 
   assert.strictEqual(task.id, taskId);
-  assert.strictEqual(task.phase, 'PLAN');
+  assert.strictEqual(task.phase, HARNESS_PHASES.PLAN);
 
   // Record a turn
   const turn = await KruschStateManager.recordTurn(taskId, {
@@ -72,12 +73,12 @@ test('Integration: KruschStateMachine executes task with MockModelAdapter', asyn
     maxTurns: 3
   });
 
-  assert.strictEqual(result.status, 'COMPLETE');
+  assert.strictEqual(result.status, HARNESS_PHASES.COMMITTED);
   assert.strictEqual(result.turnsExecuted, 1);
   assert.strictEqual(result.stagedDiffsCount, 0);
 
   const taskRecord = await KruschStateManager.getTask(result.taskId);
-  assert.strictEqual(taskRecord.phase, 'COMPLETE');
+  assert.strictEqual(taskRecord.phase, HARNESS_PHASES.COMMITTED);
 });
 
 test.after(async () => {

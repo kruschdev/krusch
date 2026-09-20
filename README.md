@@ -1,115 +1,98 @@
 <p align="center">
-  <strong>KRUSCH: The Sovereign, PostgreSQL-Grounded Coding Harness for Swappable LLMs</strong><br>
-  <span>"The database is the brain; LLMs are just the engine powering the brain."</span>
+  <strong>KRUSCH: A PostgreSQL-Backed Control Plane for Multi-Model Coding Agents</strong><br>
+  <span>"The database is the brain; LLMs are swappable compute."</span>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Node-%3E%3D18-blue.svg?style=flat-square" alt="Node Version">
   <img src="https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-blue.svg?style=flat-square" alt="PostgreSQL">
   <img src="https://img.shields.io/badge/Routing-krusch--pre--router%20%2B%20cascade-green.svg?style=flat-square" alt="Routing">
-  <img src="https://img.shields.io/badge/Context-krusch--context--mcp-purple.svg?style=flat-square" alt="Context">
-  <img src="https://img.shields.io/badge/tests-14%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/FSM-Enforced%20Verification%20Gate-orange.svg?style=flat-square" alt="FSM Enforced">
+  <img src="https://img.shields.io/badge/tests-16%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 ---
 
-## ⚡ The Core Philosophy
+## What It Is
 
-> **"The winning coding harness should make models interchangeable while keeping the workflow, context, tests, and approvals consistent."**
+`krusch` is a developer control plane and execution harness designed around a simple architectural thesis:
 
-Frontier LLMs have a competitive half-life of 3 to 6 months. Monolithic agents tightly coupled to a single model checkpoint inherit vendor lock-in, API volatility, and high cost.
+> **The winning coding harness makes models interchangeable while keeping workflow, context, ground-truth tests, and approvals consistent.**
 
-`krusch` inverts this pattern:
-* **The Brain is PostgreSQL**: Repository AST symbols, working memory, task queues, staged file diffs, approval ledgers, and test execution history live permanently in PostgreSQL.
-* **The Models are Swappable Compute**: Local open-weights specialists (`hermes3:8b`, `Qwen-Coder`), cheap edge models (`gemini-flash-lite`, `deepseek-v4-flash`), and frontier reasoning models (`claude-3-7-sonnet`, `deepseek-r1`) are dispatched dynamically via **[`krusch-pre-router`](https://github.com/kruschdev/krusch-pre-router)** and **[`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router)**.
-* **Zero Cognitive Amnesia**: If a model fails or is swapped mid-task, the next model inherits the exact same grounded database state without losing a single token of context.
+Frontier and open-weights models churn every few months. Most agent frameworks glue their loop to a single provider API and an ephemeral, in-memory transcript. `krusch` moves the durable state into PostgreSQL:
+* **Persistent State**: Tasks, turns, execution events, and staged file diffs are stored in PostgreSQL (`krusch_*` tables). If an LLM times out, hits a rate limit, or needs escalation, the next model picks up the exact same database-grounded state.
+* **Pre-Commit Staging**: Model file edits are hashed and staged in PostgreSQL first. Physical disk files are never overwritten until ground-truth verification tests pass.
+* **CPU Fast-Path Routing**: Intercepts code, SQL, and closed-world tasks in <15µs on CPU ($0.00 routing cost) before dispatching to specialized models or escalating to frontier reasoning.
 
 ---
 
-## 🏛️ Architecture Overview
+## 🏛️ Invariant State Machine (FSM)
+
+Execution follows a strictly enforced finite state machine (`KruschFSM`):
 
 ```mermaid
-graph TD
-    subgraph Clients ["Interfaces"]
-        CLI["krusch CLI (bin/krusch.js)"]
-        MCP["krusch MCP Server (Stdio)"]
-        IDE["krusch-ide / DBOS Workers"]
-    end
-
-    subgraph Harness ["Krusch Invariant Control Plane"]
-        SM["KruschStateMachine<br/>(PLAN ➔ IMPLEMENT ➔ VERIFY ➔ APPROVE)"]
-        Router["KruschCascadeRouter<br/>(L1 <15µs CPU Gate + L2 Specialist Escalation)"]
-        Norm["KruschToolNormalizer<br/>(Universal Schema Adapter)"]
-        Guard["KruschTrajectoryGuard<br/>(Repetition Loops, Turn Budgets)"]
-        RSI["KruschModularRSI<br/>(Modular Recursive Self-Improvement)"]
-        Verifier["KruschTestRunner<br/>(Deterministic Ground-Truth Oracle)"]
-        Policy["KruschApprovalPolicy<br/>(ACID Staged Diffs & Approval Gates)"]
-    end
-
-    subgraph Brain ["PostgreSQL Cognitive Substrate (kdcode)"]
-        Tasks["krusch_tasks & krusch_turns"]
-        Diffs["krusch_staged_diffs (Pre-Commit Staging)"]
-        Approvals["krusch_approvals (Audit Ledger)"]
-        Runs["krusch_verification_runs (Test Diagnostics)"]
-        Symbols["code_symbols & blobs (pg-git / krusch-context-mcp)"]
-        Memory["ide_agent_memory (Episodic Memory)"]
-    end
-
-    CLI --> SM
-    MCP --> SM
-    IDE --> SM
-
-    SM --> Router
-    Router --> Norm
-    SM --> Guard
-    SM --> Verifier
-    Verifier --> RSI
-    SM --> Policy
-
-    SM <--> Tasks
-    SM <--> Diffs
-    SM <--> Approvals
-    SM <--> Runs
-    SM <--> Symbols
-    SM <--> Memory
+stateDiagram-v2
+    [*] --> INIT
+    INIT --> PLAN : Assemble Context & Select Initial Specialist
+    PLAN --> IMPLEMENT : Model Emits stage_diff
+    IMPLEMENT --> VERIFY : Test Command Triggered
+    VERIFY --> IMPLEMENT : Test Failed (ModularRSI Attribution)
+    VERIFY --> APPROVAL_GATE : Ground-Truth Tests Passed (exitCode 0)
+    APPROVAL_GATE --> COMMITTED : User / Policy Approval (Diffs Written to Disk)
+    APPROVAL_GATE --> IMPLEMENT : User Requests Modification
+    PLAN --> COMMITTED : Read-Only / Plan-Only Task
+    PLAN --> ABORTED : Trajectory Loop / Budget Exceeded
+    IMPLEMENT --> ABORTED
+    VERIFY --> ABORTED
 ```
+
+### Hard Invariants
+1. **No Disk Writes on Failure**: `apply_staged_diff` is rejected if the task is not in `APPROVAL_GATE` or if the latest verification run failed.
+2. **Transition Gate**: `VERIFY ➔ APPROVAL_GATE` is strictly blocked unless at least one verification run executed and passed with `exit_code: 0`.
 
 ---
 
 ## 🚀 Quick Start
 
 ### 1. Installation
-From the local checkout or npm:
+Clone and install dependencies:
 ```bash
-cd /home/krusch/homelab/projects/krusch
+git clone https://github.com/kruschdev/krusch.git
+cd krusch
 npm install
 npm run migrate
 ```
 
-### 2. Configure Environment
+### 2. Environment Setup
 Copy `.env.example` to `.env`:
 ```ini
+# PostgreSQL Connection URL
 DATABASE_URL=postgresql://kdcode:password@localhost:5432/kdcode
+
+# Optional Provider Keys
 OPENROUTER_API_KEY=your_key_here
+ANTHROPIC_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
+OLLAMA_HOST=http://localhost:11434
 ```
 
 ### 3. CLI Commands
 
-#### Inspect Specialist Routing
+#### Inspect Cascade Routing
 ```bash
-# Test sub-15µs L1 routing on SQL
+# Test sub-15µs heuristic routing for an obvious SQL query
 ./bin/krusch.js route "SELECT * FROM users WHERE active = true"
 
-# View active specialist model catalog
+# Inspect active specialist catalog
 ./bin/krusch.js models
 ```
 
-#### Run an Engineering Goal
+#### Run an Engineering Task
 ```bash
-# Execute through the full harness
+# Execute through the full harness loop
 ./bin/krusch.js run "Add unit test for helper function"
 
-# Run with local deterministic mock (for testing & offline CI)
+# Run with local deterministic mock adapter (offline / CI)
 ./bin/krusch.js run --mock "Refactor error handling"
 
 # Inspect task execution record in PostgreSQL
@@ -120,31 +103,73 @@ OPENROUTER_API_KEY=your_key_here
 ```bash
 ./bin/krusch.js mcp
 ```
-Connects over stdio, exposing `krusch_run`, `krusch_route`, `krusch_task_status`, and `krusch_apply_diff` to any IDE (Claude Code, Cursor, Antigravity, or `krusch-ide`).
+Connects over stdio, exposing `krusch_run`, `krusch_route`, `krusch_task_status`, and `krusch_apply_diff` to any IDE (Claude Code, Cursor, Antigravity, or custom workers).
 
 ---
 
-## 🧪 Verification & Testing
+## 🧪 Verification & Test Suite
+
+The test suite validates router decisions, tool normalizers, trajectory loop guards, ModularRSI failure attributions, PostgreSQL persistence, and strict disk mutation blocking on test failure:
+
 ```bash
 # Run unit tests (12 tests)
 npm run test:unit
 
-# Run PostgreSQL integration tests
+# Run PostgreSQL integration & enforcement tests (4 tests)
 npm run test:integration
 
-# Run entire test suite (14 tests)
+# Run entire suite (16 tests)
 npm test
 ```
 
+### Test Coverage Highlights:
+* `✔ Enforcement: FSM strictly blocks transition to APPROVAL_GATE when tests fail`
+* `✔ Enforcement: apply_staged_diff strictly refuses to write disk on failed verification`
+* `✔ Integration: Krusch PostgreSQL state persistence and task lifecycle`
+* `✔ KruschCascadeRouter: L1 fast-path intercepts SQL queries with <15µs CPU routing`
+* `✔ KruschCascadeRouter: Escalates to frontier reasoning when failure count > 0`
+* `✔ KruschModularRSI: attributes missing module to ContextManagement`
+* `✔ KruschTrajectoryGuard: detects repetitive n-gram loops`
+
 ---
 
-## 🛡️ Key Features
+## 📂 Codebase Layout
 
-* **⚡ Sub-15µs L1 Fast-Path**: Intercepts structured syntax, SQL, and math on CPU for $0.00 without making pre-flight routing calls (powered by `krusch-pre-router`).
-* **🧠 Persistent PostgreSQL Brain**: Tasks, turns, events, and pre-commit diffs live in PostgreSQL tables (`krusch_*`), preventing cognitive amnesia on model swaps.
-* **🔒 ACID Pre-Commit Staging**: Changes are staged in `krusch_staged_diffs` with SHA-256 hashes and must pass automated test verification before physical disk mutation.
-* **🛡️ Trajectory Guard & ModularRSI**: Catches degenerative repetition loops and attributes test failures to specific harness modules (`ContextManagement`, `ToolUse`, `ObservationManagement`).
-* **🌐 Universal Tool Normalization**: Translates tool calls across OpenAI, Anthropic, and Ollama dialects into uniform execution payloads.
+```
+krusch/
+├── bin/
+│   └── krusch.js               # CLI binary entry point
+├── db/
+│   ├── schema.sql              # krusch_* tables (tasks, turns, staged diffs, verifications)
+│   └── migrate.js              # Database migration runner
+├── src/
+│   ├── brain/
+│   │   ├── pool.js             # Resilient PostgreSQL connection pool
+│   │   ├── state-manager.js    # Task, turn, staged diff persistence
+│   │   └── context-client.js   # Token-bounded repo tree and symbol formatting
+│   ├── router/
+│   │   └── cascade.js          # krusch-pre-router L1 gate + specialist pool
+│   ├── models/
+│   │   ├── adapter-base.js     # Uniform model engine interface
+│   │   ├── tool-normalizer.js  # Multi-dialect schema & response normalizer
+│   │   └── providers/          # OpenRouter, Ollama, and Mock adapters
+│   ├── workflow/
+│   │   ├── fsm.js              # Enforced finite state machine & invariant guards
+│   │   ├── state-machine.js    # Invariant execution loop coordinator
+│   │   ├── trajectory-guard.js # Sliding n-gram loop & turn budget detector
+│   │   └── modular-rsi.js      # Module-level failure attribution engine
+│   ├── verify/
+│   │   └── test-runner.js      # Child process test executor & diagnostic parser
+│   ├── approvals/
+│   │   └── policy.js           # Action permission tiers (safe, staged, manual approval)
+│   ├── tools/
+│   │   └── index.js            # Standard tools (read, stage_diff, apply_staged_diff)
+│   └── server/
+│       └── mcp-server.js       # Model Context Protocol stdio server
+└── test/
+    ├── unit/                   # Router, normalizer, trajectory guard, modular-rsi tests
+    └── integration/            # Postgres state lifecycle & disk write enforcement tests
+```
 
 ---
 

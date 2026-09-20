@@ -40,8 +40,8 @@
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "dotenv": "^16.4.7",
-    "krusch-cascade-router": "file:../krusch-cascade-router",
-    "krusch-pre-router": "file:../krusch-pre-router",
+    "krusch-cascade-router": "github:kruschdev/krusch-cascade-router",
+    "krusch-pre-router": "github:kruschdev/krusch-pre-router",
     "pg": "^8.13.3"
   }
 }

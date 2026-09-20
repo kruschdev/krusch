@@ -8,4 +8,6 @@ export { KruschTrajectoryGuard } from './workflow/trajectory-guard.js';
 export { KruschModularRSI, RSI_MODULES } from './workflow/modular-rsi.js';
 export { KruschTestRunner } from './verify/test-runner.js';
 export { KruschApprovalPolicy } from './approvals/policy.js';
+export { KruschFSM, HARNESS_PHASES } from './workflow/fsm.js';
 export { startMcpServer } from './server/mcp-server.js';
+

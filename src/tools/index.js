@@ -137,6 +137,28 @@ export class KruschTools {
     }
 
     if (name === 'apply_staged_diff') {
+      const task = await KruschStateManager.getTask(this.taskId);
+      if (!task) {
+        return { error: `Task ${this.taskId} not found.` };
+      }
+
+      // Hard Invariant Guard: Phase must be APPROVAL_GATE
+      if (task.phase !== 'APPROVAL_GATE') {
+        return {
+          error: 'MUTATION_BLOCKED_INVALID_PHASE',
+          message: `Cannot apply staged diff to disk while task is in '${task.phase}' phase. Task must pass verification and enter 'APPROVAL_GATE'.`
+        };
+      }
+
+      // Hard Invariant Guard: Ground-truth tests must have passed
+      const verifs = task.verifications || [];
+      if (verifs.length > 0 && !verifs[0].passed) {
+        return {
+          error: 'VERIFICATION_FAILED_MUTATION_BLOCKED',
+          message: `Refusing to apply staged diff to disk: ground-truth verification is failing (Exit Code: ${verifs[0].exit_code}).`
+        };
+      }
+
       const diffs = await KruschStateManager.getPendingDiffs(this.taskId);
       const target = diffs.find(d => d.id === args.diffId);
       if (!target) {

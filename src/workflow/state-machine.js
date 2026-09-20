@@ -6,6 +6,7 @@ import { KruschTools } from '../tools/index.js';
 import { KruschTrajectoryGuard } from './trajectory-guard.js';
 import { KruschModularRSI } from './modular-rsi.js';
 import { KruschApprovalPolicy } from '../approvals/policy.js';
+import { KruschFSM, HARNESS_PHASES } from './fsm.js';
 
 export class KruschStateMachine {
   constructor(options = {}) {
@@ -24,16 +25,22 @@ export class KruschStateMachine {
     const task = await KruschStateManager.createTask({
       goal,
       projectPath,
-      phase: 'PLAN',
+      phase: HARNESS_PHASES.INIT,
       metadata: { initiatedBy: 'krusch-harness', createdAt: new Date().toISOString() }
     });
 
-    console.log(`[krusch] Initialized task ${task.id} in PostgreSQL`);
+    const fsm = new KruschFSM(task.id, HARNESS_PHASES.INIT);
+    console.log(`[krusch] Initialized task ${task.id} in PostgreSQL (Phase: ${fsm.currentPhase})`);
+
     const tools = new KruschTools(task.id, projectPath, { policy: this.policy });
     const toolDefs = tools.getDefinitions();
 
     // 2. Assemble Grounded Context from AST & Memory
     const context = await KruschContextClient.assembleContext(projectPath, goal);
+    const contextPromptBlock = KruschContextClient.formatContextPrompt(context);
+
+    // Transition INIT -> PLAN
+    await fsm.transitionTo(HARNESS_PHASES.PLAN);
 
     // 3. Select Initial Model via Cascade Router
     let route = modelOverride
@@ -43,17 +50,17 @@ export class KruschStateMachine {
     console.log(`[krusch] Routing: selected [${route.modelId}] via [${route.stage}] (${route.rationale})`);
     await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
 
-    // 4. Invariant Prompt Template
-    const systemPrompt = `You are a sovereign coding agent running within the Krusch harness.
+    // 4. Invariant Prompt Template with Token-Budgeted Context
+    const systemPrompt = `You are an engineering coding agent running within the Krusch harness.
 Your goal: "${goal}"
-Repository files: ${JSON.stringify(context.files.slice(0, 30))}
-Relevant AST Symbols: ${JSON.stringify(context.symbols)}
 
-Operating Rules:
+${contextPromptBlock}
+
+Operating Workflow Rules:
 1. Always explore and read relevant files before modifying.
 2. Use 'stage_diff' to propose modifications into PostgreSQL.
 3. Use 'run_command' to run existing tests or verify syntax.
-4. When finished, summarize what was verified.`;
+4. Changes can only be applied to disk once ground-truth verification passes.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -61,11 +68,11 @@ Operating Rules:
     ];
 
     const turnHistory = [];
-    let currentPhase = 'PLAN';
     let consecutiveTestFailures = 0;
+    let latestTestPassed = false;
 
     for (let turnNum = 1; turnNum <= maxTurns; turnNum++) {
-      console.log(`[krusch] ─── Turn ${turnNum}/${maxTurns} [Model: ${route.modelId}] ───`);
+      console.log(`[krusch] ─── Turn ${turnNum}/${maxTurns} [Phase: ${fsm.currentPhase} | Model: ${route.modelId}] ───`);
 
       // Trajectory health check
       const trajectoryStatus = this.guard.evaluateTrajectory(turnHistory);
@@ -76,8 +83,8 @@ Operating Rules:
           console.log(`[krusch] Escalating turn to frontier model: ${route.modelId}`);
           await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
         } else {
-          await KruschStateManager.updateTask(task.id, { phase: 'ABORTED' });
-          return { status: 'ABORTED', reason: trajectoryStatus.reason, taskId: task.id };
+          await fsm.transitionTo(HARNESS_PHASES.ABORTED, { reason: trajectoryStatus.reason });
+          return { status: HARNESS_PHASES.ABORTED, reason: trajectoryStatus.reason, taskId: task.id };
         }
       }
 
@@ -117,15 +124,23 @@ Operating Rules:
         }))
       });
 
-      // If no tool calls, model considers turn or task finished
+      // If no tool calls, model considers task finished
       if (turnResult.toolCalls.length === 0) {
-        console.log(`[krusch] Model provided final response without further tool invocations.`);
-        currentPhase = 'COMPLETE';
+        console.log(`[krusch] Model finished generation without further tool invocations.`);
         break;
       }
 
       // Execute Tool Invocations
       for (const toolCall of turnResult.toolCalls) {
+        // FSM Transition on Action
+        if (toolCall.name === 'stage_diff' && fsm.currentPhase === HARNESS_PHASES.PLAN) {
+          await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
+        } else if (toolCall.name === 'run_command') {
+          if (fsm.currentPhase === HARNESS_PHASES.PLAN || fsm.currentPhase === HARNESS_PHASES.IMPLEMENT) {
+            await fsm.transitionTo(HARNESS_PHASES.VERIFY);
+          }
+        }
+
         console.log(`[krusch] Executing tool [${toolCall.name}]:`, JSON.stringify(toolCall.args));
         const result = await tools.executeTool(toolCall.name, toolCall.args);
 
@@ -136,48 +151,72 @@ Operating Rules:
         });
 
         // Test failure analysis via ModularRSI
-        if (toolCall.name === 'run_command' && result.passed === false) {
-          consecutiveTestFailures++;
-          const failureAttribution = KruschModularRSI.attributeFailure(result);
-          console.warn(`[krusch:rsi] Verification Failure attributed to [${failureAttribution.module}]: ${failureAttribution.diagnosis}`);
+        if (toolCall.name === 'run_command') {
+          latestTestPassed = result.passed;
+          if (!result.passed) {
+            consecutiveTestFailures++;
+            const failureAttribution = KruschModularRSI.attributeFailure(result);
+            console.warn(`[krusch:rsi] Verification Failure attributed to [${failureAttribution.module}]: ${failureAttribution.diagnosis}`);
 
-          // Escalate model if multiple consecutive verification failures occur
-          if (consecutiveTestFailures >= 2 && route.stage !== 'FRONTIER_ESCALATION') {
-            route = this.router.route(goal, { priorFailureCount: consecutiveTestFailures, requireFrontier: true });
-            console.log(`[krusch] Escalating to [${route.modelId}] due to verification failures.`);
-            await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
+            // Escalate model if multiple consecutive verification failures occur
+            if (consecutiveTestFailures >= 2 && route.stage !== 'FRONTIER_ESCALATION') {
+              route = this.router.route(goal, { priorFailureCount: consecutiveTestFailures, requireFrontier: true });
+              console.log(`[krusch] Escalating to [${route.modelId}] due to verification failures.`);
+              await KruschStateManager.updateTask(task.id, { currentModel: route.modelId });
+            }
+
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: JSON.stringify({
+                output: result.stdout || result.stderr,
+                rsi_diagnostic: failureAttribution
+              })
+            });
+            continue;
+          } else {
+            consecutiveTestFailures = 0;
           }
+        }
 
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({
-              output: result.stdout || result.stderr,
-              rsi_diagnostic: failureAttribution
-            })
-          });
-        } else {
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: JSON.stringify(result)
-          });
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result)
+        });
+      }
+    }
+
+    // Check for pending staged diffs and finalize FSM phase
+    const pendingDiffs = await KruschStateManager.getPendingDiffs(task.id);
+
+    if (pendingDiffs.length > 0) {
+      if (latestTestPassed && fsm.currentPhase === HARNESS_PHASES.VERIFY) {
+        // Safe to enter APPROVAL_GATE
+        await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
+        console.log(`[krusch] Verification PASSED. Task entered APPROVAL_GATE with ${pendingDiffs.length} staged diff(s).`);
+
+        // If auto-approve policy active, apply diffs to disk and transition to COMMITTED
+        if (this.policy.autoApprove) {
+          for (const diff of pendingDiffs) {
+            await tools.executeTool('apply_staged_diff', { diffId: diff.id });
+          }
+          await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
+          console.log(`[krusch] Auto-applied ${pendingDiffs.length} staged diff(s) to physical disk.`);
+        }
+      } else if (!latestTestPassed && fsm.currentPhase === HARNESS_PHASES.VERIFY) {
+        console.warn(`[krusch] Verification FAILED. Diffs remain staged in PostgreSQL; disk mutation strictly blocked.`);
+      }
+    } else {
+      if (fsm.currentPhase !== HARNESS_PHASES.ABORTED) {
+        if (fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
+          await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
         }
       }
     }
 
-    // Check for pending staged diffs
-    const pendingDiffs = await KruschStateManager.getPendingDiffs(task.id);
-    if (pendingDiffs.length > 0) {
-      currentPhase = 'APPROVAL';
-      console.log(`[krusch] Task has ${pendingDiffs.length} staged file modification(s) pending approval in PostgreSQL.`);
-    } else {
-      currentPhase = 'COMPLETE';
-    }
-
-    await KruschStateManager.updateTask(task.id, { phase: currentPhase });
     return {
-      status: currentPhase,
+      status: fsm.currentPhase,
       taskId: task.id,
       turnsExecuted: turnHistory.length,
       stagedDiffsCount: pendingDiffs.length,
