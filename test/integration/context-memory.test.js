@@ -65,6 +65,16 @@ test('Context & Indexer: KruschSymbolIndexer indexes workspace and searchCodeSym
   assert.strictEqual(foundClass[0].symbol_name, 'LedgerManager');
   assert.strictEqual(foundClass[0].symbol_type, 'class');
 
+  // 3. Re-run indexProject: verify idempotency via ON CONFLICT upsert (no duplication)
+  const reindexResult = await KruschSymbolIndexer.indexProject(tempDir);
+  assert.ok(reindexResult.symbolsIndexed >= 2, 'Re-indexing must succeed idempotently');
+
+  const countRes = await query(
+    'SELECT COUNT(*)::int AS count FROM krusch_code_symbols WHERE project_path = $1',
+    [tempDir]
+  );
+  assert.strictEqual(countRes.rows[0].count, 2, 'Symbols count must remain exactly 2 without duplicating rows');
+
   // Cleanup temp files
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

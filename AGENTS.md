@@ -23,6 +23,10 @@
 4. **Actionable Failure Attribution**:
    - Failures must be attributed to specific modules (`ContextManagement`, `ToolUse`, `ObservationManagement`, `AgentLoop`) using `KruschFailureClassifier` (`KruschModularRSI`) rather than blind re-prompting.
 
+5. **Authoritative Phase Transitions & Catalog Graph**:
+   - Phase transitions are validated against the PostgreSQL catalog `krusch_phase_edges` in row-locked transactions.
+   - The cyclic retry edge `VERIFY -> IMPLEMENT` enables restaging upon test failure, strictly bounded by `maxPhaseRevisits` (default 3) before transitioning to `ABORTED` to prevent endless oscillation.
+
 ---
 
 ## 🛠️ Key Commands

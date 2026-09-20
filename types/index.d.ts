@@ -268,6 +268,7 @@ export class KruschStateMachine {
     modelOverride?: string | null;
   }): Promise<{
     status: HarnessPhase;
+    reason?: string;
     taskId: string;
     turnsExecuted: number;
     stagedDiffsCount: number;

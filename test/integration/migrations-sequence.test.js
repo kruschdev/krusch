@@ -12,7 +12,7 @@ dotenv.config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
 
 const connectionString = process.env.DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
 
-test('Migration Engine: Sequential migrations 001->008 apply idempotently on catalog', async () => {
+test('Migration Engine: Sequential migrations 001->009 apply idempotently on catalog', async () => {
   const pool = new pg.Pool({ connectionString });
   const client = await pool.connect();
 
@@ -29,6 +29,7 @@ test('Migration Engine: Sequential migrations 001->008 apply idempotently on cat
     assert.ok(applied.includes('006_task_verification_command'));
     assert.ok(applied.includes('007_guard_rejected_diff_commit'));
     assert.ok(applied.includes('008_context_and_memory_tables'));
+    assert.ok(applied.includes('009_code_symbols_unique_and_upsert'));
 
     // Check verification_command column on krusch_tasks
     const colRes = await client.query(`

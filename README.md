@@ -7,9 +7,9 @@
   <img src="https://img.shields.io/badge/version-0.1.0-blue.svg?style=flat-square" alt="Version 0.1.0">
   <img src="https://img.shields.io/badge/Node-%3E%3D20-blue.svg?style=flat-square" alt="Node Version">
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
-  <a href="https://github.com/kruschDev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschDev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kruschdev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
-  <img src="https://img.shields.io/badge/tests-57%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-59%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 > **Status**: *Experimental, single-maintainer, requires PostgreSQL.*
@@ -79,9 +79,9 @@ State lives in ten core relational tables:
 - `krusch_verification_runs`: Ground-truth test execution records (command, exit code, stdout, stderr, failure module attribution, and parsed error locations).
 - `krusch_approvals`: Human-in-the-loop and policy approval requests.
 - `krusch_phase_edges`: Canonical relational definition of legal state machine transitions.
-- `krusch_code_symbols`: Native AST symbols index for self-contained context grounding.
+- `krusch_code_symbols`: Native code symbols index (regex symbol stub) for self-contained context grounding.
 - `krusch_memories`: Native episodic task decisions and context entries.
-- `krusch_schema_migrations`: Versioned sequential migration history (`001` through `008`).
+- `krusch_schema_migrations`: Versioned sequential migration history (`001` through `009`).
 
 ---
 
@@ -90,7 +90,7 @@ State lives in ten core relational tables:
 When ground-truth verification fails, `KruschFailureClassifier` (also exported as `KruschModularRSI`) parses test stdout and stderr into four modular failure classes, injecting structured diagnostics into the prompt rather than blindly re-prompting:
 
 1. **`ContextManagement`** (Missing imports, undefined symbols, module resolution failures):
-   - Identifies the missing identifier and queries the AST symbol index.
+   - Identifies the missing identifier and queries the code symbol index.
    - Injects targeted symbol definitions and file paths directly into the prompt.
 2. **`ToolUse`** (Syntax errors, JSON formatting errors, schema argument errors):
    - Injects line-level syntax diagnostics and enforces strict parameter formatting.

@@ -138,6 +138,9 @@ program
       console.log('\n' + chalk.bold.green('✓ Task Execution Finished:'));
       console.log(`  Task ID:        ${chalk.yellow(result.taskId)}`);
       console.log(`  Final Phase:    ${chalk.cyan(result.status)}`);
+      if (result.reason) {
+        console.log(`  Reason:         ${chalk.yellow(result.reason)}`);
+      }
       console.log(`  Turns Executed: ${result.turnsExecuted}`);
       console.log(`  Staged Diffs:   ${result.stagedDiffsCount}`);
       console.log(`  Final Model:    ${chalk.magenta(result.finalModel)}`);
@@ -218,6 +221,9 @@ program
       console.log(chalk.bold.cyan(`\n📦 Task Status: ${task.id}`));
       console.log(`  Goal:          ${task.goal}`);
       console.log(`  Phase:         ${chalk.yellow(task.phase)}`);
+      if (task.metadata && task.metadata.reason) {
+        console.log(`  Reason:        ${chalk.red(task.metadata.reason)}`);
+      }
       console.log(`  Active Model:  ${task.current_model || 'none'}`);
       console.log(`  Turns:         ${task.turns.length}`);
       console.log(`  Staged Diffs:  ${task.stagedDiffs.length}`);

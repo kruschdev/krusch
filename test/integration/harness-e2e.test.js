@@ -48,23 +48,28 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
   // Turn 5 (VERIFY): Model runs verification test, which passes
   const mock = new MockModelAdapter();
 
-  // Turn 1 (PLAN): Inspect repository
+  // Turn 1 (PLAN): Inspect repository and signal plan completion
   mock.setNextResponse({
-    text: 'Examining buggy calculator implementation.',
+    text: 'Examining buggy calculator implementation and formulating plan.',
     toolCalls: [
       {
         id: 'call_turn1_read',
         name: 'read_file',
         args: { path: 'src/calculator.js' }
+      },
+      {
+        id: 'call_turn1_finish',
+        name: 'finish_plan',
+        args: { planSummary: 'Fix addition operator in src/calculator.js' }
       }
     ],
     usage: { total_tokens: 80, prompt_tokens: 50, completion_tokens: 30 },
     latencyMs: 10
   });
 
-  // Turn 2 (IMPLEMENT): Stage flawed fix
+  // Turn 2 (IMPLEMENT): Stage flawed fix and request verification
   mock.setNextResponse({
-    text: 'Staging initial fix into PostgreSQL.',
+    text: 'Staging initial fix into PostgreSQL and requesting verification.',
     toolCalls: [
       {
         id: 'call_turn2_stage',
@@ -74,6 +79,11 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
           content: flawedStagedCode,
           explanation: 'Initial fix attempt'
         }
+      },
+      {
+        id: 'call_turn2_req_verify',
+        name: 'request_verification',
+        args: { reason: 'Initial fix staged' }
       }
     ],
     usage: { total_tokens: 110, prompt_tokens: 70, completion_tokens: 40 },
@@ -96,7 +106,7 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
     latencyMs: 15
   });
 
-  // Turn 4 (IMPLEMENT): Restage correct fix
+  // Turn 4 (IMPLEMENT): Restage correct fix and request verification
   mock.setNextResponse({
     text: 'Restaging correct addition logic following test failure diagnosis.',
     toolCalls: [
@@ -108,6 +118,11 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
           content: correctStagedCode,
           explanation: 'Restaged correct addition logic'
         }
+      },
+      {
+        id: 'call_turn4_req_verify',
+        name: 'request_verification',
+        args: { reason: 'Restaged fix ready for verification' }
       }
     ],
     usage: { total_tokens: 120, prompt_tokens: 75, completion_tokens: 45 },

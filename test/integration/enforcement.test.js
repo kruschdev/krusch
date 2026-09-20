@@ -161,7 +161,7 @@ test('Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporar
       id: taskId,
       goal: 'Test crash-safe atomic apply',
       projectPath: tempDir,
-      phase: HARNESS_PHASES.VERIFY
+      phase: HARNESS_PHASES.IMPLEMENT
     });
 
     const tools = new KruschTools(taskId, tempDir, { autoApprove: true });
@@ -171,9 +171,12 @@ test('Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporar
       path: targetRelFile,
       content: 'ATOMIC DURABLE CONTENT WRITTEN VIA FSYNC AND RENAME',
       explanation: 'Testing crash safety'
-    });
+    }, { phase: HARNESS_PHASES.IMPLEMENT });
     assert.strictEqual(staged.status, 'STAGED');
     assert.ok(staged.diffId);
+
+    // Transition IMPLEMENT -> VERIFY
+    await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.VERIFY });
 
     // 2. Verification fails: disk MUST NOT be touched
     await KruschStateManager.recordVerificationRun(taskId, {
@@ -184,7 +187,7 @@ test('Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporar
       passed: false
     });
 
-    const failedApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId });
+    const failedApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId }, { phase: HARNESS_PHASES.APPROVAL_GATE });
     assert.ok(failedApply.error);
     assert.strictEqual(fs.existsSync(targetAbsFile), false, 'Disk file MUST NOT exist on test failure');
 
@@ -201,7 +204,7 @@ test('Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporar
     await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
 
     // 4. Apply staged diff to disk
-    const successApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId });
+    const successApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId }, { phase: HARNESS_PHASES.APPROVAL_GATE });
     assert.strictEqual(successApply.status, 'APPLIED');
     assert.strictEqual(fs.existsSync(targetAbsFile), true, 'File must exist on disk after passing verification');
     assert.strictEqual(fs.readFileSync(targetAbsFile, 'utf-8'), 'ATOMIC DURABLE CONTENT WRITTEN VIA FSYNC AND RENAME');
@@ -298,7 +301,7 @@ test('Enforcement: apply_staged_diff detects working tree drift and blocks overw
       id: taskId,
       goal: 'Test working tree drift detection',
       projectPath: tempDir,
-      phase: HARNESS_PHASES.VERIFY
+      phase: HARNESS_PHASES.IMPLEMENT
     });
 
     const tools = new KruschTools(taskId, tempDir, { autoApprove: true });
@@ -308,8 +311,11 @@ test('Enforcement: apply_staged_diff detects working tree drift and blocks overw
       path: targetRelFile,
       content: JSON.stringify({ version: '2.0.0', env: 'production' }, null, 2),
       explanation: 'Upgrade version'
-    });
+    }, { phase: HARNESS_PHASES.IMPLEMENT });
     assert.strictEqual(staged.status, 'STAGED');
+
+    // Transition IMPLEMENT -> VERIFY
+    await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.VERIFY });
 
     // 2. Simulate passing verification run and transition to APPROVAL_GATE
     await KruschStateManager.recordVerificationRun(taskId, {
@@ -329,7 +335,7 @@ test('Enforcement: apply_staged_diff detects working tree drift and blocks overw
     fs.writeFileSync(targetAbsFile, driftedContent, 'utf-8');
 
     // 4. Attempt to apply staged diff - MUST FAIL with WORKING_TREE_DRIFT_DETECTED
-    const driftResult = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId });
+    const driftResult = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId }, { phase: HARNESS_PHASES.APPROVAL_GATE });
     assert.ok(driftResult.error, 'Should return error on disk drift');
     assert.strictEqual(driftResult.error, 'WORKING_TREE_DRIFT_DETECTED');
     assert.ok(driftResult.message.includes('working tree file'));
@@ -345,7 +351,7 @@ test('Enforcement: apply_staged_diff detects working tree drift and blocks overw
     fs.writeFileSync(targetAbsFile, originalFileContent, 'utf-8');
 
     // 6. Now apply should succeed
-    const validApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId });
+    const validApply = await tools.executeTool('apply_staged_diff', { diffId: staged.diffId }, { phase: HARNESS_PHASES.APPROVAL_GATE });
     assert.strictEqual(validApply.status, 'APPLIED');
     assert.strictEqual(
       fs.readFileSync(targetAbsFile, 'utf-8'),

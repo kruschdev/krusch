@@ -14,12 +14,13 @@ function getPhaseObjective(phase, verificationCommand) {
       return `[ACTIVE HARNESS PHASE: PLAN]
 Phase Objective: Read-only repository discovery and mapping.
 - Inspect relevant files with 'read_file' and locate symbols with 'search_symbols'.
-- Propose a concrete implementation plan.
+- Propose a concrete implementation plan, then call 'finish_plan' when ready to proceed.
 - Invariant Rule: Tool 'stage_diff' is strictly withheld in PLAN. Do not attempt disk mutations.`;
     case HARNESS_PHASES.IMPLEMENT:
       return `[ACTIVE HARNESS PHASE: IMPLEMENT]
 Phase Objective: Code modification and staging.
 - Stage atomic file updates directly into PostgreSQL ACID substrate using 'stage_diff'.
+- Call 'request_verification' when all necessary files are staged to proceed to testing.
 - Invariant Rule: All staged diffs are stored in PostgreSQL; disk writes remain strictly blocked until verification passes.`;
     case HARNESS_PHASES.VERIFY:
       return `[ACTIVE HARNESS PHASE: VERIFY]
@@ -122,7 +123,6 @@ Operating Workflow Rules:
 5. In APPROVAL_GATE phase: Apply staged diffs to disk via 'apply_staged_diff' once verified.`;
 
     const messages = [
-      { role: 'system', content: systemPrompt },
       { role: 'user', content: `Execute the following engineering goal: ${goal}` }
     ];
 
@@ -132,6 +132,9 @@ Operating Workflow Rules:
     let latestFailureClass = null;
     let remediationCount = 0;
     const MAX_REMEDIATIONS = 3;
+    let hasReadInPlan = false;
+    let verifyFailureRevisits = 0;
+    const maxPhaseRevisits = this.options.maxPhaseRevisits || 3;
 
     for (let turnNum = 1; turnNum <= maxTurns; turnNum++) {
       console.log(`[krusch] ─── Turn ${turnNum}/${maxTurns} [Phase: ${fsm.currentPhase} | Model: ${route.modelId}] ───`);
@@ -159,10 +162,25 @@ Operating Workflow Rules:
       const activeToolDefs = tools.getDefinitions(fsm.currentPhase);
       const phaseDirective = getPhaseObjective(fsm.currentPhase, task.verification_command);
 
-      // Inject active turn objective into turn messages
+      // Refresh system prompt on each turn with current phase objective and context block
+      const dynamicSystemPrompt = `You are an engineering coding agent running within the Krusch harness.
+Your goal: "${goal}"
+
+${phaseDirective}
+
+${contextPromptBlock}
+
+Operating Workflow Rules:
+1. Phase-Scoped Tool Discipline: Each turn operates within an explicit FSM phase with designated tools.
+2. In PLAN phase: Inspect and read relevant files before modifying (use token-bounded 'read_file' and 'search_symbols'). Call 'finish_plan' when ready to proceed.
+3. In IMPLEMENT phase: Use 'stage_diff' to propose modifications into PostgreSQL ACID storage. Call 'request_verification' when staging is complete.
+4. In VERIFY phase: Use 'run_command' to run existing tests or verify syntax.
+5. In APPROVAL_GATE phase: Apply staged diffs to disk via 'apply_staged_diff' once verified.`;
+
+      // System message is always at index 0 and updated with active phase directive
       const turnMessages = [
-        ...messages,
-        { role: 'user', content: phaseDirective }
+        { role: 'system', content: dynamicSystemPrompt },
+        ...messages
       ];
 
       // Execute Model Turn with phase-scoped tools
@@ -201,19 +219,27 @@ Operating Workflow Rules:
         }))
       });
 
-      // If no tool calls, model considers current turn generation finished
-      if (turnResult.toolCalls.length === 0) {
-        console.log(`[krusch] Model finished generation without further tool invocations.`);
-        const currentDiffs = await KruschStateManager.getStagedDiffs(task.id);
-        if (currentDiffs.length === 0 && fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
-          await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
-          console.log(`[krusch:fsm] Read-only task completed without staged diffs. Transitioned to COMMITTED.`);
-          break;
-        }
-      }
+      let planFinishedSignal = false;
+      let verificationRequested = false;
+      let stagedInThisTurn = false;
 
       // Execute Tool Invocations
       for (const toolCall of turnResult.toolCalls) {
+        if (toolCall.name === 'read_file' || toolCall.name === 'search_symbols') {
+          if (fsm.currentPhase === HARNESS_PHASES.PLAN) {
+            hasReadInPlan = true;
+          }
+        }
+        if (toolCall.name === 'finish_plan') {
+          planFinishedSignal = true;
+        }
+        if (toolCall.name === 'stage_diff') {
+          stagedInThisTurn = true;
+        }
+        if (toolCall.name === 'request_verification') {
+          verificationRequested = true;
+        }
+
         console.log(`[krusch] Executing tool [${toolCall.name}]:`, JSON.stringify(toolCall.args));
         const result = await tools.executeTool(toolCall.name, toolCall.args, { phase: fsm.currentPhase });
 
@@ -292,20 +318,34 @@ Operating Workflow Rules:
       const latestRun = await KruschStateManager.getLatestVerificationRun(task.id);
 
       if (fsm.currentPhase === HARNESS_PHASES.PLAN) {
-        if (turnResult.toolCalls.length === 0 && pendingDiffs.length === 0) {
-          if (fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
+        if (planFinishedSignal) {
+          await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
+          console.log(`[krusch:fsm] Planning completed via finish_plan. Transitioned PLAN -> IMPLEMENT.`);
+        } else if (turnResult.toolCalls.length === 0) {
+          if (hasReadInPlan) {
+            await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
+            console.log(`[krusch:fsm] Planning concluded with implementation formulation. Transitioned PLAN -> IMPLEMENT.`);
+          } else if (pendingDiffs.length === 0 && fsm.canTransitionTo(HARNESS_PHASES.COMMITTED)) {
             await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
             console.log(`[krusch:fsm] Read-only task completed in PLAN phase. Transitioned to COMMITTED.`);
             break;
           }
         } else {
-          await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
-          console.log(`[krusch:fsm] Planning turn concluded. Transitioned PLAN -> IMPLEMENT.`);
+          console.log(`[krusch:fsm] Exploration continues in PLAN phase.`);
         }
       } else if (fsm.currentPhase === HARNESS_PHASES.IMPLEMENT) {
-        if (pendingDiffs.length > 0) {
+        if (verificationRequested) {
+          if (pendingDiffs.length > 0) {
+            await fsm.transitionTo(HARNESS_PHASES.VERIFY);
+            console.log(`[krusch:fsm] Verification explicitly requested with ${pendingDiffs.length} staged diff(s). Transitioned IMPLEMENT -> VERIFY.`);
+          } else {
+            console.warn(`[krusch:fsm] Verification requested but no pending diffs staged. Remaining in IMPLEMENT.`);
+          }
+        } else if (!stagedInThisTurn && pendingDiffs.length > 0) {
           await fsm.transitionTo(HARNESS_PHASES.VERIFY);
-          console.log(`[krusch:fsm] Staged diffs detected (${pendingDiffs.length}). Transitioned IMPLEMENT -> VERIFY.`);
+          console.log(`[krusch:fsm] Staging completed (${pendingDiffs.length} pending diffs). Transitioned IMPLEMENT -> VERIFY.`);
+        } else if (stagedInThisTurn) {
+          console.log(`[krusch:fsm] Active diff staged this turn. Remaining in IMPLEMENT for multi-file staging.`);
         }
       } else if (fsm.currentPhase === HARNESS_PHASES.VERIFY) {
         if (latestRun && latestRun.passed && latestRun.exit_code === 0) {
@@ -319,8 +359,22 @@ Operating Workflow Rules:
           }
           break;
         } else if (latestRun && !latestRun.passed) {
+          verifyFailureRevisits++;
+          if (verifyFailureRevisits >= maxPhaseRevisits) {
+            const abortReason = `Exceeded maximum verification retry budget (${maxPhaseRevisits} revisits). Aborting task to prevent oscillation.`;
+            console.error(`[krusch:fsm] ${abortReason}`);
+            await fsm.transitionTo(HARNESS_PHASES.ABORTED, { reason: abortReason });
+            return {
+              status: HARNESS_PHASES.ABORTED,
+              reason: abortReason,
+              taskId: task.id,
+              turnsExecuted: turnHistory.length,
+              stagedDiffsCount: pendingDiffs.length,
+              finalModel: route.modelId
+            };
+          }
           await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
-          console.warn(`[krusch:fsm] Verification failed. Transitioned VERIFY -> IMPLEMENT to allow restaging.`);
+          console.warn(`[krusch:fsm] Verification failed (attempt ${verifyFailureRevisits}/${maxPhaseRevisits}). Transitioned VERIFY -> IMPLEMENT to allow restaging.`);
         }
       }
     }

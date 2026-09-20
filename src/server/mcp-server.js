@@ -164,10 +164,14 @@ export async function startMcpServer() {
       }
 
       if (name === 'krusch_apply_diff') {
+        const task = await KruschStateManager.getTask(args.taskId);
+        if (!task) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+        }
         const tools = new KruschTools(args.taskId, process.cwd(), {
           policy: new KruschApprovalPolicy({ autoApprove: true })
         });
-        const res = await tools.executeTool('apply_staged_diff', { diffId: args.diffId });
+        const res = await tools.executeTool('apply_staged_diff', { diffId: args.diffId }, { phase: task.phase });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       }
 

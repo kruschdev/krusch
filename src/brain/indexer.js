@@ -3,8 +3,8 @@ import path from 'path';
 import { query } from './pool.js';
 
 export class KruschSymbolIndexer {
-  /**
-   * Walk projectPath and index exported AST/code symbols into krusch_code_symbols.
+   /**
+   * Walk projectPath and index exported code symbols (regex symbol stub) into krusch_code_symbols.
    */
   static async indexProject(projectPath, options = {}) {
     const maxFiles = options.maxFiles || 100;
@@ -47,7 +47,13 @@ export class KruschSymbolIndexer {
         try {
           await query(
             `INSERT INTO krusch_code_symbols (project_path, file_path, symbol_name, symbol_type, start_line, end_line, signature)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (project_path, file_path, symbol_name, start_line)
+             DO UPDATE SET
+               symbol_type = EXCLUDED.symbol_type,
+               end_line = EXCLUDED.end_line,
+               signature = EXCLUDED.signature,
+               created_at = CURRENT_TIMESTAMP`,
             [
               sym.project_path,
               sym.file_path,
@@ -60,7 +66,7 @@ export class KruschSymbolIndexer {
           );
           indexedCount++;
         } catch (_) {
-          // Ignore duplicate / insert errors
+          // Ignore transient database insert errors
         }
       }
     }

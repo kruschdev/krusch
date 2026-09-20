@@ -75,6 +75,28 @@ export class KruschTools {
           },
           required: ['diffId']
         }
+      },
+      {
+        name: 'finish_plan',
+        description: 'Signal that repository discovery and planning is complete, transitioning the task to IMPLEMENT phase.',
+        parameters: {
+          type: 'object',
+          properties: {
+            planSummary: { type: 'string', description: 'Concise summary of the implementation plan and files to modify' }
+          },
+          required: []
+        }
+      },
+      {
+        name: 'request_verification',
+        description: 'Signal that all staged diffs are ready and request immediate transition to VERIFY phase to run tests.',
+        parameters: {
+          type: 'object',
+          properties: {
+            reason: { type: 'string', description: 'Rationale or summary of staged modifications ready for verification' }
+          },
+          required: []
+        }
       }
     ];
 
@@ -84,11 +106,11 @@ export class KruschTools {
 
     switch (phase) {
       case 'PLAN':
-        // Discovery & formulation; read-only mapping, no stage_diff or disk mutation
-        return allDefs.filter(t => ['read_file', 'search_symbols'].includes(t.name));
+        // Discovery & formulation; read-only mapping + explicit plan completion
+        return allDefs.filter(t => ['read_file', 'search_symbols', 'finish_plan'].includes(t.name));
       case 'IMPLEMENT':
-        // Active staging into PostgreSQL ACID storage; stage only
-        return allDefs.filter(t => ['read_file', 'search_symbols', 'stage_diff'].includes(t.name));
+        // Active staging into PostgreSQL ACID storage; stage and request verification
+        return allDefs.filter(t => ['read_file', 'search_symbols', 'stage_diff', 'request_verification'].includes(t.name));
       case 'VERIFY':
         // Verification testing; run test commands against staged changes; no stage_diff or apply
         return allDefs.filter(t => ['read_file', 'run_command'].includes(t.name));
@@ -101,31 +123,59 @@ export class KruschTools {
   }
 
   async executeTool(name, args = {}, options = {}) {
-    // Phase Invariant 1: stage_diff can only be executed in IMPLEMENT
-    if (name === 'stage_diff' && options.phase && options.phase !== 'IMPLEMENT') {
-      return {
-        status: 'BLOCKED',
-        error: 'INVARIANT_VIOLATION',
-        message: `Cannot stage diff while task is in phase '${options.phase}'. Code staging is only permitted in IMPLEMENT phase.`
-      };
+    // Phase Invariant 1: stage_diff strictly requires explicit IMPLEMENT phase
+    if (name === 'stage_diff') {
+      if (!options.phase || options.phase !== 'IMPLEMENT') {
+        return {
+          status: 'BLOCKED',
+          error: 'INVARIANT_VIOLATION',
+          message: `Cannot stage diff: options.phase must be explicitly 'IMPLEMENT' (received '${options.phase || 'none'}'). Code staging is only permitted in IMPLEMENT phase.`
+        };
+      }
     }
 
-    // Phase Invariant 2: apply_staged_diff can only be executed in APPROVAL_GATE
-    if (name === 'apply_staged_diff' && options.phase && options.phase !== 'APPROVAL_GATE') {
-      return {
-        status: 'BLOCKED',
-        error: 'INVARIANT_VIOLATION',
-        message: `Cannot apply staged diff to physical disk while task is in phase '${options.phase}'. Verification tests must pass and task must enter APPROVAL_GATE first.`
-      };
+    // Phase Invariant 2: apply_staged_diff strictly requires explicit APPROVAL_GATE phase
+    if (name === 'apply_staged_diff') {
+      if (!options.phase || options.phase !== 'APPROVAL_GATE') {
+        return {
+          status: 'BLOCKED',
+          error: 'INVARIANT_VIOLATION',
+          message: `Cannot apply staged diff to physical disk: options.phase must be explicitly 'APPROVAL_GATE' (received '${options.phase || 'none'}'). Verification tests must pass first.`
+        };
+      }
     }
 
-    // Phase Invariant 3: run_command is blocked in PLAN
-    if (name === 'run_command' && options.phase && options.phase === 'PLAN') {
-      return {
-        status: 'BLOCKED',
-        error: 'INVARIANT_VIOLATION',
-        message: `Command execution is prohibited during PLAN phase. Use read_file and search_symbols to map the repository.`
-      };
+    // Phase Invariant 3: run_command is blocked in PLAN and requires explicit phase
+    if (name === 'run_command') {
+      if (!options.phase || options.phase === 'PLAN') {
+        return {
+          status: 'BLOCKED',
+          error: 'INVARIANT_VIOLATION',
+          message: `Command execution is prohibited during PLAN phase or without explicit phase (received '${options.phase || 'none'}').`
+        };
+      }
+    }
+
+    // Phase Invariant 4: finish_plan is only permitted in PLAN
+    if (name === 'finish_plan') {
+      if (!options.phase || options.phase !== 'PLAN') {
+        return {
+          status: 'BLOCKED',
+          error: 'INVARIANT_VIOLATION',
+          message: `finish_plan is only permitted during PLAN phase (received '${options.phase || 'none'}').`
+        };
+      }
+    }
+
+    // Phase Invariant 5: request_verification is only permitted in IMPLEMENT
+    if (name === 'request_verification') {
+      if (!options.phase || options.phase !== 'IMPLEMENT') {
+        return {
+          status: 'BLOCKED',
+          error: 'INVARIANT_VIOLATION',
+          message: `request_verification is only permitted during IMPLEMENT phase (received '${options.phase || 'none'}').`
+        };
+      }
     }
 
     const policyResult = this.policy.evaluate(name, args);
@@ -243,6 +293,22 @@ export class KruschTools {
       } catch (err) {
         return { error: err.code || 'CRASH_SAFE_APPLY_FAILED', message: err.message };
       }
+    }
+
+    if (name === 'finish_plan') {
+      return {
+        status: 'PLAN_FINISHED',
+        planSummary: args.planSummary || 'Repository inspection complete. Ready to proceed to implementation.',
+        message: 'Planning complete. Transitioning to IMPLEMENT phase.'
+      };
+    }
+
+    if (name === 'request_verification') {
+      return {
+        status: 'VERIFICATION_REQUESTED',
+        reason: args.reason || 'All file modifications staged. Ready for verification.',
+        message: 'Verification requested. Transitioning to VERIFY phase.'
+      };
     }
 
     return { error: `Unknown tool: ${name}` };
