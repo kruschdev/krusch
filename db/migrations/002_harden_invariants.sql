@@ -1,100 +1,29 @@
--- PostgreSQL Schema for Krusch Coding Harness
--- Durable state for multi-model coding agents with enforced verification invariants.
+-- Migration 002: Harden Invariants & Concurrency Leases
+-- 1. Align default task phase to INIT
+-- 2. Add project_path and single-writer file leases on krusch_staged_diffs
+-- 3. Enforce ground-truth verification and shortcut guards directly in PostgreSQL triggers
 
-CREATE TABLE IF NOT EXISTS krusch_schema_migrations (
-    version VARCHAR(128) PRIMARY KEY,
-    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+-- 1. Default phase alignment
+ALTER TABLE krusch_tasks ALTER COLUMN phase SET DEFAULT 'INIT';
 
-CREATE TABLE IF NOT EXISTS krusch_tasks (
-    id VARCHAR(64) PRIMARY KEY,
-    goal TEXT NOT NULL,
-    project_path TEXT NOT NULL,
-    phase VARCHAR(32) NOT NULL DEFAULT 'INIT' CHECK (phase IN ('INIT', 'PLAN', 'IMPLEMENT', 'VERIFY', 'APPROVAL_GATE', 'COMMITTED', 'ABORTED')),
-    current_model VARCHAR(128),
-    metadata JSONB DEFAULT '{}'::jsonb,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+-- 2. Add project_path column to krusch_staged_diffs if not present
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'krusch_staged_diffs' AND column_name = 'project_path'
+    ) THEN
+        ALTER TABLE krusch_staged_diffs ADD COLUMN project_path TEXT;
+    END IF;
+END $$;
 
-CREATE TABLE IF NOT EXISTS krusch_turns (
-    id SERIAL PRIMARY KEY,
-    task_id VARCHAR(64) REFERENCES krusch_tasks(id) ON DELETE CASCADE,
-    turn_number INTEGER NOT NULL,
-    model_id VARCHAR(128) NOT NULL,
-    input_messages JSONB NOT NULL,
-    output_text TEXT,
-    thought_trace TEXT,
-    token_usage JSONB DEFAULT '{}'::jsonb,
-    latency_ms INTEGER,
-    routing_stage VARCHAR(32), -- L1_FAST_PATH, L2_CENTROID, FRONTIER_ESCALATION, DIRECT
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+-- Backfill project_path from parent task
+UPDATE krusch_staged_diffs d
+SET project_path = t.project_path
+FROM krusch_tasks t
+WHERE d.task_id = t.id AND d.project_path IS NULL;
 
-CREATE TABLE IF NOT EXISTS krusch_events (
-    id SERIAL PRIMARY KEY,
-    task_id VARCHAR(64) REFERENCES krusch_tasks(id) ON DELETE CASCADE,
-    turn_id INTEGER REFERENCES krusch_turns(id) ON DELETE CASCADE,
-    event_type VARCHAR(64) NOT NULL,
-    payload JSONB NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS krusch_staged_diffs (
-    id SERIAL PRIMARY KEY,
-    task_id VARCHAR(64) REFERENCES krusch_tasks(id) ON DELETE CASCADE,
-    project_path TEXT,
-    file_path TEXT NOT NULL,
-    original_content TEXT,
-    staged_content TEXT NOT NULL,
-    diff_patch TEXT,
-    status VARCHAR(32) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPLIED', 'REJECTED')),
-    sha256_hash VARCHAR(64),
-    original_sha256 VARCHAR(64),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    applied_at TIMESTAMP WITH TIME ZONE
-);
-
-CREATE TABLE IF NOT EXISTS krusch_approvals (
-    id SERIAL PRIMARY KEY,
-    task_id VARCHAR(64) REFERENCES krusch_tasks(id) ON DELETE CASCADE,
-    action_type VARCHAR(64) NOT NULL, -- apply_diff, run_shell, destructive_op
-    target_resource TEXT NOT NULL,
-    status VARCHAR(32) DEFAULT 'PENDING', -- PENDING, APPROVED, REJECTED, AUTO_BYPASSED
-    requested_by_model VARCHAR(128),
-    decision_reason TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    decided_at TIMESTAMP WITH TIME ZONE
-);
-
-CREATE TABLE IF NOT EXISTS krusch_verification_runs (
-    id SERIAL PRIMARY KEY,
-    task_id VARCHAR(64) REFERENCES krusch_tasks(id) ON DELETE CASCADE,
-    command TEXT NOT NULL,
-    exit_code INTEGER NOT NULL,
-    stdout TEXT,
-    stderr TEXT,
-    passed BOOLEAN NOT NULL,
-    failure_module VARCHAR(64), -- AgentLoop, ToolUse, ObservationManagement, ContextManagement
-    extracted_errors JSONB DEFAULT '[]'::jsonb,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Optimization & foreign key indexes
-CREATE INDEX IF NOT EXISTS idx_krusch_tasks_phase ON krusch_tasks(phase);
-CREATE INDEX IF NOT EXISTS idx_krusch_turns_task ON krusch_turns(task_id, turn_number);
-CREATE INDEX IF NOT EXISTS idx_krusch_events_task ON krusch_events(task_id);
-CREATE INDEX IF NOT EXISTS idx_krusch_staged_diffs_task ON krusch_staged_diffs(task_id, status);
-CREATE INDEX IF NOT EXISTS idx_krusch_approvals_task ON krusch_approvals(task_id, status);
-CREATE INDEX IF NOT EXISTS idx_krusch_verif_task ON krusch_verification_runs(task_id);
-CREATE INDEX IF NOT EXISTS idx_krusch_verif_task_latest ON krusch_verification_runs(task_id, id DESC, created_at DESC);
-
--- Unique single-writer file lease per file per project
-CREATE UNIQUE INDEX IF NOT EXISTS idx_krusch_staged_diffs_project_file_pending
-ON krusch_staged_diffs (project_path, file_path)
-WHERE status = 'PENDING';
-
--- Auto-populate project_path from parent task on stage_diff insert
+-- Auto-populate project_path from parent task if omitted on insert
 CREATE OR REPLACE FUNCTION set_krusch_staged_diff_project_path()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -113,7 +42,17 @@ CREATE TRIGGER trg_set_krusch_staged_diff_project_path
     FOR EACH ROW
     EXECUTE FUNCTION set_krusch_staged_diff_project_path();
 
--- Authoritative FSM State Transition Guard Trigger
+-- Resolve legacy pending diffs before creating unique index
+UPDATE krusch_staged_diffs
+SET status = 'REJECTED'
+WHERE status = 'PENDING';
+
+-- 3. Unique partial index enforcing single-writer lease per file per project
+CREATE UNIQUE INDEX IF NOT EXISTS idx_krusch_staged_diffs_project_file_pending
+ON krusch_staged_diffs (project_path, file_path)
+WHERE status = 'PENDING';
+
+-- 4. Invariant-Enforcing FSM Transition Trigger Function
 CREATE OR REPLACE FUNCTION check_krusch_task_phase_transition()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -126,13 +65,13 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Terminal state: cannot transition from COMMITTED or ABORTED
+    -- Terminal state invariant: no transitions out of COMMITTED or ABORTED
     IF OLD.phase IN ('COMMITTED', 'ABORTED') THEN
         RAISE EXCEPTION 'Terminal state: cannot transition from terminal phase % to %', OLD.phase, NEW.phase
             USING ERRCODE = 'check_violation';
     END IF;
 
-    -- Enforce legal transition graph & invariant rules
+    -- Topological transition graph checks
     IF OLD.phase = 'INIT' AND NEW.phase NOT IN ('PLAN', 'ABORTED') THEN
         RAISE EXCEPTION 'Invalid FSM transition: cannot transition from % to %', OLD.phase, NEW.phase
             USING ERRCODE = 'check_violation';
@@ -213,7 +152,7 @@ CREATE TRIGGER trg_krusch_task_phase_transition
     FOR EACH ROW
     EXECUTE FUNCTION check_krusch_task_phase_transition();
 
--- Staged Diff Apply Guard Trigger: disk apply allowed only from APPROVAL_GATE with passing tests
+-- 5. Staged Diff Apply Guard Trigger: disk apply allowed only from APPROVAL_GATE with passing tests
 CREATE OR REPLACE FUNCTION check_krusch_staged_diff_apply()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -223,12 +162,14 @@ DECLARE
     v_verif_exists BOOLEAN;
 BEGIN
     IF NEW.status = 'APPLIED' AND (OLD.status IS DISTINCT FROM 'APPLIED') THEN
+        -- Check parent task phase is APPROVAL_GATE
         SELECT phase INTO v_task_phase FROM krusch_tasks WHERE id = NEW.task_id;
         IF v_task_phase IS NULL OR v_task_phase <> 'APPROVAL_GATE' THEN
             RAISE EXCEPTION 'Invariant Violation: Cannot mark staged diff % as APPLIED while task % is in phase % (must be APPROVAL_GATE)', NEW.id, NEW.task_id, COALESCE(v_task_phase, 'UNKNOWN')
                 USING ERRCODE = 'check_violation';
         END IF;
 
+        -- Check latest verification run passed
         SELECT passed, exit_code, TRUE
         INTO v_latest_passed, v_latest_exit, v_verif_exists
         FROM krusch_verification_runs

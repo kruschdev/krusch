@@ -32,8 +32,9 @@ test('Integration: Krusch PostgreSQL state persistence and task lifecycle', asyn
   assert.strictEqual(turn.turn_number, 1);
 
   // Stage a diff in PostgreSQL
+  const testFilePath = `test/sample_${Date.now()}.txt`;
   const staged = await KruschStateManager.stageDiff(taskId, {
-    filePath: 'test/sample.txt',
+    filePath: testFilePath,
     originalContent: 'hello',
     stagedContent: 'hello world',
     diffPatch: 'Added world'
@@ -46,11 +47,27 @@ test('Integration: Krusch PostgreSQL state persistence and task lifecycle', asyn
   assert.strictEqual(retrieved.id, taskId);
   assert.strictEqual(retrieved.turns.length, 1);
   assert.strictEqual(retrieved.stagedDiffs.length, 1);
-  assert.strictEqual(retrieved.stagedDiffs[0].file_path, 'test/sample.txt');
+  assert.strictEqual(retrieved.stagedDiffs[0].file_path, testFilePath);
 
-  // Update diff status
+  // Progress task through lifecycle: PLAN -> IMPLEMENT -> VERIFY -> APPROVAL_GATE
+  await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.IMPLEMENT });
+  await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.VERIFY });
+  await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'Tests passed',
+    stderr: '',
+    passed: true
+  });
+  await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.APPROVAL_GATE });
+
+  // Update diff status to APPLIED (allowed in APPROVAL_GATE with passing verification)
   const updatedDiff = await KruschStateManager.updateDiffStatus(staged.id, 'APPLIED');
   assert.strictEqual(updatedDiff.status, 'APPLIED');
+
+  // Transition to COMMITTED
+  const finalTask = await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.COMMITTED });
+  assert.strictEqual(finalTask.phase, HARNESS_PHASES.COMMITTED);
 });
 
 test('Integration: KruschStateMachine executes task with MockModelAdapter', async () => {

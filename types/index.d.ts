@@ -46,6 +46,7 @@ export interface TurnRecord {
 export interface StagedDiffRecord {
   id: number;
   task_id: string;
+  project_path?: string;
   file_path: string;
   original_content: string | null;
   staged_content: string;
@@ -131,6 +132,7 @@ export class KruschStateManager {
       originalContent?: string | null;
       stagedContent: string;
       diffPatch?: string;
+      projectPath?: string;
     }
   ): Promise<StagedDiffRecord>;
 

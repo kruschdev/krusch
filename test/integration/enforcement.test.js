@@ -124,7 +124,7 @@ test('Enforcement: PLAN -> COMMITTED shortcut is strictly forbidden when staged 
 
   // Stage a diff into PostgreSQL while in PLAN
   await KruschStateManager.stageDiff(taskId, {
-    filePath: 'lib/core.js',
+    filePath: `lib/core_${taskId}.js`,
     originalContent: 'old code',
     stagedContent: 'new code',
     diffPatch: 'staged change'
@@ -144,6 +144,9 @@ test('Enforcement: PLAN -> COMMITTED shortcut is strictly forbidden when staged 
 
   // State must remain in PLAN
   assert.strictEqual(fsm.currentPhase, HARNESS_PHASES.PLAN);
+
+  // Abort task to release pending lease in database
+  await fsm.transitionTo(HARNESS_PHASES.ABORTED);
 });
 
 test('Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporary directory', async () => {
@@ -351,6 +354,324 @@ test('Enforcement: apply_staged_diff detects working tree drift and blocks overw
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('Enforcement: Database trigger enforces verification invariant on VERIFY -> APPROVAL_GATE via raw SQL', async () => {
+  const taskId = `trg_verif_gate_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test SQL-level verification gate',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.VERIFY
+  });
+
+  // 1. Attempt raw SQL transition to APPROVAL_GATE with ZERO verification runs: MUST FAIL
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.APPROVAL_GATE, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('without running at least one verification test'));
+      return true;
+    }
+  );
+
+  // 2. Record a FAILED verification run
+  await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 1,
+    stdout: '',
+    stderr: 'Test suite failed',
+    passed: false
+  });
+
+  // Attempt raw SQL transition when latest run failed: MUST FAIL
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.APPROVAL_GATE, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('while ground-truth verification is failing'));
+      return true;
+    }
+  );
+
+  // 3. Record a PASSING verification run
+  await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'All green',
+    stderr: '',
+    passed: true
+  });
+
+  // Attempt raw SQL transition now: MUST SUCCEED
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.APPROVAL_GATE, taskId]);
+  const task = await KruschStateManager.getTask(taskId);
+  assert.strictEqual(task.phase, HARNESS_PHASES.APPROVAL_GATE);
+
+  // Cleanly abort to conclude test
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+});
+
+test('Enforcement: Database trigger enforces PLAN -> COMMITTED shortcut guard via raw SQL', async () => {
+  const taskId = `trg_plan_shortcut_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test SQL-level PLAN -> COMMITTED shortcut guard',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  // Stage a diff for this task
+  await KruschStateManager.stageDiff(taskId, {
+    filePath: `tmp/file_${Date.now()}.js`,
+    originalContent: '',
+    stagedContent: 'console.log("hello");',
+    diffPatch: 'new file'
+  });
+
+  // Attempt raw SQL shortcut PLAN -> COMMITTED: MUST FAIL at trigger level
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('Cannot shortcut from PLAN to COMMITTED while staged diffs exist'));
+      return true;
+    }
+  );
+
+  // Abort task to release staged diff lease
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+});
+
+test('Enforcement: Database trigger enforces APPROVAL_GATE -> COMMITTED guard via raw SQL', async () => {
+  const taskId = `trg_gate_commit_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test SQL-level APPROVAL_GATE -> COMMITTED pending diff guard',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.VERIFY
+  });
+
+  // Stage diff
+  const staged = await KruschStateManager.stageDiff(taskId, {
+    filePath: `tmp/gate_file_${Date.now()}.js`,
+    originalContent: '',
+    stagedContent: 'code',
+    diffPatch: 'patch'
+  });
+
+  // Pass verification
+  await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'Pass',
+    stderr: '',
+    passed: true
+  });
+
+  // Transition to APPROVAL_GATE
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.APPROVAL_GATE, taskId]);
+
+  // Attempt to transition to COMMITTED while diff is still PENDING: MUST FAIL
+  await assert.rejects(
+    async () => {
+      await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('while unapplied staged diffs remain PENDING'));
+      return true;
+    }
+  );
+
+  // Mark diff as APPLIED
+  await KruschStateManager.updateDiffStatus(staged.id, 'APPLIED');
+
+  // Transition to COMMITTED: MUST SUCCEED now that no pending diffs remain
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+  const task = await KruschStateManager.getTask(taskId);
+  assert.strictEqual(task.phase, HARNESS_PHASES.COMMITTED);
+});
+
+test('Enforcement: Database trigger prevents marking diff APPLIED unless task is in APPROVAL_GATE with passing tests', async () => {
+  const taskId = `trg_diff_apply_${Date.now()}`;
+  await KruschStateManager.createTask({
+    id: taskId,
+    goal: 'Test SQL-level staged diff apply guard',
+    projectPath: process.cwd(),
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  const staged = await KruschStateManager.stageDiff(taskId, {
+    filePath: `tmp/apply_guard_${Date.now()}.js`,
+    originalContent: '',
+    stagedContent: 'content',
+    diffPatch: 'patch'
+  });
+
+  // Attempt to mark as APPLIED while task is in PLAN: MUST FAIL
+  await assert.rejects(
+    async () => {
+      await query("UPDATE krusch_staged_diffs SET status = 'APPLIED' WHERE id = $1", [staged.id]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('must be APPROVAL_GATE'));
+      return true;
+    }
+  );
+
+  // Transition to VERIFY
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.IMPLEMENT, taskId]);
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.VERIFY, taskId]);
+
+  // Attempt to mark as APPLIED while in VERIFY: MUST FAIL
+  await assert.rejects(
+    async () => {
+      await query("UPDATE krusch_staged_diffs SET status = 'APPLIED' WHERE id = $1", [staged.id]);
+    },
+    (err) => {
+      assert.ok(err.message.includes('must be APPROVAL_GATE'));
+      return true;
+    }
+  );
+
+  // Record passing verification and enter APPROVAL_GATE
+  await KruschStateManager.recordVerificationRun(taskId, {
+    command: 'npm test',
+    exitCode: 0,
+    stdout: 'Passed',
+    stderr: '',
+    passed: true
+  });
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.APPROVAL_GATE, taskId]);
+
+  // Now marking as APPLIED: MUST SUCCEED
+  await query("UPDATE krusch_staged_diffs SET status = 'APPLIED' WHERE id = $1", [staged.id]);
+  const diffs = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [staged.id]);
+  assert.strictEqual(diffs.rows[0].status, 'APPLIED');
+
+  // Finish task
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.COMMITTED, taskId]);
+});
+
+test('Enforcement: Single-writer file concurrency lease prevents concurrent conflicting pending diffs', async () => {
+  const projectPath = `/tmp/krusch-concurrency-test-${Date.now()}`;
+  const sharedFilePath = 'src/shared-module.js';
+
+  const taskA = `task_a_${Date.now()}`;
+  const taskB = `task_b_${Date.now()}`;
+
+  await KruschStateManager.createTask({
+    id: taskA,
+    goal: 'Task A editing shared file',
+    projectPath,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  await KruschStateManager.createTask({
+    id: taskB,
+    goal: 'Task B attempting concurrent modification',
+    projectPath,
+    phase: HARNESS_PHASES.PLAN
+  });
+
+  // 1. Task A stages shared file: succeeds and holds lease
+  const stagedA = await KruschStateManager.stageDiff(taskA, {
+    filePath: sharedFilePath,
+    originalContent: '// initial',
+    stagedContent: '// version by Task A',
+    diffPatch: 'edit A',
+    projectPath
+  });
+  assert.strictEqual(stagedA.status, 'PENDING');
+
+  // 2. Task B attempts to stage same file in same project: MUST FAIL due to concurrency lease
+  await assert.rejects(
+    async () => {
+      await KruschStateManager.stageDiff(taskB, {
+        filePath: sharedFilePath,
+        originalContent: '// initial',
+        stagedContent: '// version by Task B (collision)',
+        diffPatch: 'edit B',
+        projectPath
+      });
+    },
+    (err) => {
+      assert.ok(
+        err.message.includes('CONCURRENCY_LEASE_CONFLICT') ||
+        err.message.includes('idx_krusch_staged_diffs_project_file_pending')
+      );
+      return true;
+    }
+  );
+
+  // Also verify raw SQL insert from Task B is rejected directly by PostgreSQL unique index
+  await assert.rejects(
+    async () => {
+      await query(
+        `INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, staged_content, status)
+         VALUES ($1, $2, $3, $4, 'PENDING')`,
+        [taskB, projectPath, sharedFilePath, '// raw SQL conflict']
+      );
+    },
+    (err) => {
+      assert.ok(err.message.includes('idx_krusch_staged_diffs_project_file_pending'));
+      return true;
+    }
+  );
+
+  // 3. Task A updates its own staged diff: MUST SUCCEED (re-staging by same task updates in place)
+  const stagedA2 = await KruschStateManager.stageDiff(taskA, {
+    filePath: sharedFilePath,
+    originalContent: '// initial',
+    stagedContent: '// version by Task A - iteration 2',
+    diffPatch: 'edit A revision',
+    projectPath
+  });
+  assert.strictEqual(stagedA2.id, stagedA.id);
+  assert.strictEqual(stagedA2.staged_content, '// version by Task A - iteration 2');
+
+  // 4. Task A is aborted: releases lease
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskA]);
+
+  // Verify Task A's staged diff status was automatically changed to REJECTED by trigger
+  const diffCheck = await query('SELECT status FROM krusch_staged_diffs WHERE id = $1', [stagedA.id]);
+  assert.strictEqual(diffCheck.rows[0].status, 'REJECTED');
+
+  // 5. Task B can now successfully stage the file
+  const stagedB = await KruschStateManager.stageDiff(taskB, {
+    filePath: sharedFilePath,
+    originalContent: '// initial',
+    stagedContent: '// version by Task B now that lease is free',
+    diffPatch: 'edit B succeeding',
+    projectPath
+  });
+  assert.strictEqual(stagedB.status, 'PENDING');
+
+  // Clean up Task B
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskB]);
+});
+
+test('Enforcement: Default task phase in PostgreSQL is INIT when omitted on INSERT', async () => {
+  const taskId = `default_phase_${Date.now()}`;
+  await query(
+    'INSERT INTO krusch_tasks (id, goal, project_path) VALUES ($1, $2, $3)',
+    [taskId, 'Test default phase', process.cwd()]
+  );
+
+  const res = await query('SELECT phase FROM krusch_tasks WHERE id = $1', [taskId]);
+  assert.strictEqual(res.rows[0].phase, 'INIT', 'Column default must be INIT');
+
+  await query('UPDATE krusch_tasks SET phase = $1 WHERE id = $2', [HARNESS_PHASES.ABORTED, taskId]);
+});
+
+test('Enforcement: Versioned migration catalog tracks applied migrations', async () => {
+  const res = await query('SELECT version FROM krusch_schema_migrations ORDER BY version ASC');
+  const versions = res.rows.map(r => r.version);
+  assert.ok(versions.includes('001_initial_schema'));
+  assert.ok(versions.includes('002_harden_invariants'));
 });
 
 test.after(async () => {

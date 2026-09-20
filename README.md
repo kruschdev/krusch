@@ -7,8 +7,8 @@
   <img src="https://img.shields.io/badge/Node-%3E%3D18-blue.svg?style=flat-square" alt="Node Version">
   <img src="https://img.shields.io/badge/PostgreSQL-16%20Transactional-blue.svg?style=flat-square" alt="PostgreSQL">
   <img src="https://img.shields.io/badge/Routing-krusch--pre--router%20%2B%20cascade-green.svg?style=flat-square" alt="Routing">
-  <img src="https://img.shields.io/badge/FSM-DB--Level%20Trigger%20Guarded-orange.svg?style=flat-square" alt="DB FSM Enforced">
-  <img src="https://img.shields.io/badge/tests-21%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/FSM-Catalog%20Invariant%20Engine-orange.svg?style=flat-square" alt="DB Invariant Engine Enforced">
+  <img src="https://img.shields.io/badge/tests-28%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 ---
@@ -22,9 +22,10 @@
 Frontier and open-weights models churn rapidly. Most agent frameworks couple their execution loop to a single provider API and an ephemeral, in-process transcript. `krusch` stores primary state in PostgreSQL:
 * **Durable Task State**: Tasks, turns, execution events, and staged file diffs are persisted in PostgreSQL (`krusch_*` tables). If an LLM times out, hits a rate limit, or requires escalation, the next model resumes from the authoritative database record.
 * **Pre-Commit Staging & Crash-Safe Apply**: Model file edits are hashed and staged in PostgreSQL first. Physical disk files are only written when ground-truth verification passes, using atomic write + `fsync` + rename semantics.
-* **Working Tree Drift Protection**: Staged diff apply employs optimistic concurrency control, verifying that live disk files have not drifted out-of-band before writing.
+* **Working Tree Drift Protection & File Leases**: Staged diff apply employs optimistic concurrency control against disk drift. Repository-wide file staging is protected by database-enforced single-writer leases (`idx_krusch_staged_diffs_project_file_pending`).
 * **Fast Heuristic Routing**: Evaluates syntax, SQL, and closed-world queries on CPU (<15µs, $0.00) via sibling routers before dispatching to specialized models or escalating to frontier reasoning.
-* **Database-Level Invariant FSM**: Phase transitions and verification gates are guarded both by PostgreSQL transaction row locks (`SELECT ... FOR UPDATE`) and database-level `BEFORE UPDATE` triggers and `CHECK` constraints.
+* **Catalog-Level Invariant Engine**: Phase transitions, verification requirements (`VERIFY -> APPROVAL_GATE`), shortcut protections (`PLAN -> COMMITTED`), and diff apply permissions are enforced directly in PostgreSQL triggers and catalog constraints.
+* **Versioned Schema Migrations**: Atomic sequential migration engine (`db/migrations/001_...`, `002_...`) tracked durably in `krusch_schema_migrations`.
 
 ---
 
@@ -62,12 +63,14 @@ stateDiagram-v2
 ```
 
 ### Hard Invariants
-1. **No Disk Writes on Failure**: `apply_staged_diff` is rejected unless the task is in `APPROVAL_GATE` and the latest verification run passed with `exit_code: 0`.
-2. **Optimistic Working Tree Drift Detection**: `apply_staged_diff` verifies SHA-256 base hashes against the live disk file to reject overwrites if the file was modified externally during verification.
-3. **Transition Gate**: `VERIFY ➔ APPROVAL_GATE` is strictly blocked unless at least one verification run executed and the true latest run passed.
-4. **No Staged Diff Shortcuts**: `PLAN ➔ COMMITTED` is strictly forbidden if any staged diffs exist. All code modifications must pass through `IMPLEMENT ➔ VERIFY ➔ APPROVAL_GATE`.
-5. **Crash-Safe Apply**: Disk mutations use atomic file replacement (temp file write, `fsync`, and POSIX rename) before updating PostgreSQL diff status to `APPLIED`.
-6. **Database-Level Authority**: State transitions are enforced at the PostgreSQL engine level via a `BEFORE UPDATE` trigger function (`check_krusch_task_phase_transition`), preventing illegal transitions even from raw SQL mutations.
+1. **Catalog-Enforced Verification Gate**: `VERIFY ➔ APPROVAL_GATE` is strictly blocked at the PostgreSQL trigger level unless at least one verification run executed and the true latest run passed with `exit_code: 0`.
+2. **Catalog-Enforced Diff Apply Guard**: Marking staged diffs as `APPLIED` is strictly blocked at the PostgreSQL trigger level unless the parent task is in `APPROVAL_GATE` and verification tests passed.
+3. **Optimistic Working Tree Drift Detection**: `apply_staged_diff` verifies SHA-256 base hashes against the live disk file to reject overwrites if the file was modified externally during verification.
+4. **Single-Writer File Concurrency Leases**: Repository-wide file staging is protected by PostgreSQL unique partial index `(project_path, file_path) WHERE status = 'PENDING'`. Concurrent tasks cannot stage conflicting modifications on the same file.
+5. **No Staged Diff Shortcuts**: `PLAN ➔ COMMITTED` is strictly forbidden at both application and database catalog levels if any staged diffs exist. All code modifications must pass through `IMPLEMENT ➔ VERIFY ➔ APPROVAL_GATE`.
+6. **No Incomplete Commits**: `APPROVAL_GATE ➔ COMMITTED` is strictly rejected by database trigger if unapplied pending diffs remain.
+7. **Crash-Safe Apply**: Disk mutations use atomic file replacement (temp file write, `fsync`, and POSIX rename) before updating PostgreSQL diff status to `APPLIED`.
+8. **Catalog-Level Invariant Engine**: The state machine is enforced in PostgreSQL via `BEFORE UPDATE` triggers and constraints, aborting invalid transitions or unverified phase jumps even if executed via direct SQL (`psql`).
 
 ---
 
@@ -134,20 +137,24 @@ The test suite validates router decisions, tool normalizers, trajectory loop gua
 # Run unit tests (12 tests)
 npm run test:unit
 
-# Run PostgreSQL integration & enforcement tests (9 tests)
+# Run PostgreSQL integration & enforcement tests (16 tests)
 npm run test:integration
 
-# Run entire suite (21 tests)
+# Run entire suite (28 tests)
 npm test
 ```
 
 ### Test Coverage Highlights:
-* `✔ Enforcement: Test suite runs against live PostgreSQL with active CHECK constraints`
-* `✔ Enforcement: In-database phase constraint rejects invalid phase mutations at SQL layer`
+* `✔ Enforcement: Database trigger enforces verification invariant on VERIFY -> APPROVAL_GATE via raw SQL`
+* `✔ Enforcement: Database trigger enforces PLAN -> COMMITTED shortcut guard via raw SQL`
+* `✔ Enforcement: Database trigger enforces APPROVAL_GATE -> COMMITTED guard via raw SQL`
+* `✔ Enforcement: Database trigger prevents marking diff APPLIED unless task is in APPROVAL_GATE with passing tests`
+* `✔ Enforcement: Single-writer file concurrency lease prevents concurrent conflicting pending diffs`
+* `✔ Enforcement: Default task phase in PostgreSQL is INIT when omitted on INSERT`
+* `✔ Enforcement: Versioned migration catalog tracks applied migrations`
 * `✔ Enforcement: Database trigger rejects illegal phase transitions at PostgreSQL catalog level`
 * `✔ Enforcement: apply_staged_diff detects working tree drift and blocks overwrite`
 * `✔ Enforcement: Latest verification run strictly respects chronological ordering (ORDER BY id DESC, created_at DESC)`
-* `✔ Enforcement: PLAN -> COMMITTED shortcut is strictly forbidden when staged diffs exist`
 * `✔ Enforcement: Crash-safe atomic apply (fsync + rename) in isolated temporary directory`
 * `✔ Integration: Krusch PostgreSQL state persistence and task lifecycle`
 * `✔ Integration: KruschStateMachine executes task with MockModelAdapter`
@@ -165,8 +172,11 @@ krusch/
 ├── bin/
 │   └── krusch.js               # CLI binary entry point
 ├── db/
-│   ├── schema.sql              # krusch_* tables (tasks, turns, staged diffs, verifications)
-│   └── migrate.js              # Database migration runner
+│   ├── schema.sql              # Consolidated schema reference
+│   ├── migrate.js              # Versioned migration runner
+│   └── migrations/             # Sequential migration files
+│       ├── 001_initial_schema.sql
+│       └── 002_harden_invariants.sql
 ├── src/
 │   ├── brain/
 │   │   ├── pool.js             # Resilient PostgreSQL connection pool

@@ -5,7 +5,7 @@ export class KruschStateManager {
   /**
    * Create a new task in PostgreSQL.
    */
-  static async createTask({ id, goal, projectPath, phase = 'PLAN', currentModel = null, metadata = {} }) {
+  static async createTask({ id, goal, projectPath, phase = 'INIT', currentModel = null, metadata = {} }) {
     const taskId = id || `task_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const sql = `
       INSERT INTO krusch_tasks (id, goal, project_path, phase, current_model, metadata, created_at, updated_at)
@@ -110,18 +110,52 @@ export class KruschStateManager {
 
   /**
    * Stage a file diff into PostgreSQL before disk mutation.
+   * Enforces single-writer file lease per (project_path, file_path).
    */
-  static async stageDiff(taskId, { filePath, originalContent, stagedContent, diffPatch }) {
+  static async stageDiff(taskId, { filePath, originalContent, stagedContent, diffPatch, projectPath = null }) {
     const hash = crypto.createHash('sha256').update(stagedContent).digest('hex');
     const originalHash = (originalContent !== null && originalContent !== undefined && originalContent !== '')
       ? crypto.createHash('sha256').update(originalContent).digest('hex')
       : null;
+
+    let targetProjectPath = projectPath;
+    if (!targetProjectPath) {
+      const taskRes = await query('SELECT project_path FROM krusch_tasks WHERE id = $1', [taskId]);
+      targetProjectPath = taskRes.rows[0]?.project_path || process.cwd();
+    }
+
+    // Check for existing pending diff lease on this file in this project
+    const existingRes = await query(
+      `SELECT id, task_id FROM krusch_staged_diffs WHERE project_path = $1 AND file_path = $2 AND status = 'PENDING'`,
+      [targetProjectPath, filePath]
+    );
+
+    if (existingRes.rows.length > 0) {
+      const existing = existingRes.rows[0];
+      if (existing.task_id === taskId) {
+        // Same task updating its staged diff
+        const updateSql = `
+          UPDATE krusch_staged_diffs
+          SET original_content = $1, staged_content = $2, diff_patch = $3, sha256_hash = $4, original_sha256 = $5, created_at = NOW()
+          WHERE id = $6
+          RETURNING *;
+        `;
+        const res = await query(updateSql, [originalContent, stagedContent, diffPatch, hash, originalHash, existing.id]);
+        return res.rows[0];
+      } else {
+        // Different task holds the lease
+        throw new Error(
+          `CONCURRENCY_LEASE_CONFLICT: File '${filePath}' is currently staged by pending task '${existing.task_id}'. Cannot stage concurrent modification.`
+        );
+      }
+    }
+
     const sql = `
-      INSERT INTO krusch_staged_diffs (task_id, file_path, original_content, staged_content, diff_patch, status, sha256_hash, original_sha256, created_at)
-      VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, NOW())
+      INSERT INTO krusch_staged_diffs (task_id, project_path, file_path, original_content, staged_content, diff_patch, status, sha256_hash, original_sha256, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7, $8, NOW())
       RETURNING *;
     `;
-    const res = await query(sql, [taskId, filePath, originalContent, stagedContent, diffPatch, hash, originalHash]);
+    const res = await query(sql, [taskId, targetProjectPath, filePath, originalContent, stagedContent, diffPatch, hash, originalHash]);
     return res.rows[0];
   }
 
