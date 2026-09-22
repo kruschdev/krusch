@@ -34,7 +34,7 @@ When you clone this repository, you get a fully functional, self-contained headl
 │  ✓ Operator Controls: CLI/MCP abort, retry, reject, explain status    │
 │  ✓ OpenTelemetry Spans & Cost Ledger: Audit trace JSON per task       │
 │  ✓ Real PR-Ready Patch Export: Myers unified diff for git apply       │
-│  ✓ Stdio MCP Server: 6-tool IDE bridge for KD Code or Claude Desktop   │
+│  ✓ Stdio MCP Server: 7-tool IDE bridge for KD Code or Claude Desktop   │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -227,7 +227,7 @@ npm run test:unit
 # Run storage engine property & PostgreSQL integration tests
 npm run test:integration
 
-# Run full test suite (78 tests across unit, integration, and ephemeral)
+# Run full test suite (79 tests across unit, integration, and ephemeral)
 npm test
 
 # Verify TypeScript declarations (zero errors)
