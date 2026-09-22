@@ -49,7 +49,7 @@ export class KruschStateMachine {
   /**
    * Run a goal through the complete invariant coding harness lifecycle.
    */
-  async runTask({ goal, projectPath = process.cwd(), maxTurns = 10, modelOverride = null, verificationCommand = null }) {
+  async runTask({ taskId = null, goal, projectPath = process.cwd(), maxTurns = 10, modelOverride = null, verificationCommand = null, autoApprove = undefined }) {
     // 0. Startup Crash Recovery & Lease Maintenance: inspect and resolve in-flight applies, and prune expired leases
     const recovered = await KruschStateManager.recoverInFlightApplies(projectPath);
     if (recovered.length > 0) {
@@ -61,25 +61,46 @@ export class KruschStateMachine {
     }
 
     const pinnedModel = modelOverride || this.options.pinnedModel || null;
+    const shouldAutoApprove = autoApprove !== undefined ? Boolean(autoApprove) : Boolean(this.policy.autoApprove);
 
     // 1. Initialize Task in PostgreSQL Cognitive Substrate
-    const task = await KruschStateManager.createTask({
-      goal,
-      projectPath,
-      phase: HARNESS_PHASES.INIT,
-      verificationCommand,
-      metadata: {
-        initiatedBy: 'krusch-harness',
-        pinnedModel,
-        createdAt: new Date().toISOString()
+    let task;
+    if (taskId) {
+      task = await KruschStateManager.getTask(taskId);
+      if (!task) {
+        task = await KruschStateManager.createTask({
+          id: taskId,
+          goal,
+          projectPath,
+          phase: HARNESS_PHASES.INIT,
+          verificationCommand,
+          metadata: {
+            initiatedBy: 'krusch-harness',
+            pinnedModel,
+            createdAt: new Date().toISOString()
+          }
+        });
       }
-    });
+    } else {
+      task = await KruschStateManager.createTask({
+        goal,
+        projectPath,
+        phase: HARNESS_PHASES.INIT,
+        verificationCommand,
+        metadata: {
+          initiatedBy: 'krusch-harness',
+          pinnedModel,
+          createdAt: new Date().toISOString()
+        }
+      });
+    }
 
     const fsm = new KruschFSM(task.id, HARNESS_PHASES.INIT);
     console.log(`[krusch] Initialized task ${task.id} in PostgreSQL (Phase: ${fsm.currentPhase})`);
 
+    const policy = new KruschApprovalPolicy({ autoApprove: shouldAutoApprove });
     const tools = new KruschTools(task.id, projectPath, {
-      policy: this.policy,
+      policy,
       verificationCommand: task.verification_command
     });
 
@@ -352,7 +373,7 @@ Operating Workflow Rules:
           await fsm.transitionTo(HARNESS_PHASES.APPROVAL_GATE);
           console.log(`[krusch:fsm] Ground-truth verification PASSED. Transitioned VERIFY -> APPROVAL_GATE.`);
 
-          if (this.policy.autoApprove) {
+          if (shouldAutoApprove) {
             const batchResult = await KruschStateManager.applyDiffBatch(task.id, null, projectPath);
             await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
             console.log(`[krusch:fsm] Auto-applied ${batchResult.appliedCount} staged diff(s) to physical disk. Task COMMITTED.`);

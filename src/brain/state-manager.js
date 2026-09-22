@@ -1100,6 +1100,19 @@ export class KruschStateManager {
     `;
     const updateRes = await client.query(updateSql, [targetPhase, JSON.stringify(updatedMetadata), task.id]);
 
+    // Update staged diffs status upon terminal transitions
+    if (targetPhase === 'COMMITTED') {
+      await client.query(
+        `UPDATE krusch_staged_diffs SET status = 'COMMITTED' WHERE task_id = $1 AND status = 'APPLIED'`,
+        [task.id]
+      );
+    } else if (targetPhase === 'ABORTED') {
+      await client.query(
+        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
+        [task.id]
+      );
+    }
+
     // Log transition event in krusch_events
     await client.query(`
       INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)

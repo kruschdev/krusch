@@ -506,7 +506,7 @@ leaseCommand
       for (const l of leases) {
         const remainingStr = l.is_expired
           ? chalk.red('EXPIRED')
-          : `${l.seconds_remaining}s remaining`;
+          : (l.seconds_remaining != null ? `${l.seconds_remaining}s remaining` : chalk.gray('permanent/none'));
         console.log(`  File:    ${chalk.bold(l.file_path)}`);
         console.log(`  Task:    ${chalk.yellow(l.task_id)}`);
         console.log(`  Status:  ${chalk.magenta(l.status)}`);

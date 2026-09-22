@@ -11,17 +11,21 @@ import {
 
 import { KruschStateMachine } from '../workflow/state-machine.js';
 import { KruschStateManager } from '../brain/state-manager.js';
+import { KruschFSM, HARNESS_PHASES } from '../workflow/fsm.js';
 import { query } from '../brain/pool.js';
 import crypto from 'crypto';
 
 /**
  * Krusch MCP Server
  *
- * Exposes a thin, 4-tool async control plane interface for KD Code / IDEs:
+ * Exposes a thin, 7-tool async control plane interface for KD Code / IDEs:
  * 1. krusch_run: Non-blocking asynchronous task dispatch.
  * 2. krusch_task_status: Polling status endpoint with event timeline and verification state.
  * 3. krusch_diff: Unified diff inspector for staged modifications in PostgreSQL.
  * 4. krusch_apply_diff: Human approval trigger to 2PC journal and write working tree.
+ * 5. krusch_explain: Invariant blocker diagnostics & transition feasibility.
+ * 6. krusch_reject: Reject staged diffs and release file concurrency leases.
+ * 7. krusch_abort: Explicitly abort task and unlock working tree leases.
  */
 export async function startMcpServer() {
   // Startup Crash Recovery & Lease Maintenance for long-lived MCP server
@@ -43,8 +47,6 @@ export async function startMcpServer() {
     { capabilities: { tools: {} } }
   );
 
-  const stateMachine = new KruschStateMachine();
-
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
@@ -57,7 +59,8 @@ export async function startMcpServer() {
               goal: { type: 'string', description: 'Engineering task or objective' },
               projectPath: { type: 'string', description: 'Working directory path (defaults to current)' },
               modelOverride: { type: 'string', description: 'Optional model override' },
-              autoApprove: { type: 'boolean', description: 'Whether to auto-apply diffs upon passing verification' }
+              autoApprove: { type: 'boolean', description: 'Whether to auto-apply diffs upon passing verification' },
+              useMock: { type: 'boolean', description: 'Run with local deterministic mock adapter (offline/testing)' }
             },
             required: ['goal']
           }
@@ -153,7 +156,14 @@ export async function startMcpServer() {
         });
 
         // Launch execution asynchronously in background (non-blocking for stdio transport)
-        stateMachine.runTask({
+        const harness = new KruschStateMachine({
+          autoApprove: Boolean(args.autoApprove),
+          useMock: Boolean(args.useMock),
+          simulateMockTrajectory: Boolean(args.useMock),
+          pinnedModel: args.modelOverride || null
+        });
+
+        harness.runTask({
           taskId,
           goal: args.goal,
           projectPath,
@@ -233,7 +243,12 @@ export async function startMcpServer() {
         const batchRes = await KruschStateManager.applyDiffBatch(args.taskId, diffIds, task.project_path || process.cwd());
         const remainingPending = await KruschStateManager.getPendingDiffs(args.taskId);
         if (remainingPending.length === 0) {
-          await KruschStateManager.updateTask(args.taskId, { phase: 'COMMITTED' });
+          try {
+            const fsm = new KruschFSM(args.taskId, task.phase);
+            await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
+          } catch (_) {
+            await KruschStateManager.updateTask(args.taskId, { phase: HARNESS_PHASES.COMMITTED });
+          }
         }
         return { content: [{ type: 'text', text: JSON.stringify(batchRes, null, 2) }] };
       }
