@@ -17,8 +17,10 @@ import { KruschCascadeRouter, DEFAULT_SPECIALISTS } from '../src/router/cascade.
 import { KruschStateManager } from '../src/brain/state-manager.js';
 import { startMcpServer } from '../src/server/mcp-server.js';
 import { migrate } from '../db/migrate.js';
-import { query, pool } from '../src/brain/pool.js';
+import { query, pool, enableEphemeralMode } from '../src/brain/pool.js';
 import { HARNESS_PHASES } from '../src/workflow/fsm.js';
+import { generateUnifiedDiff } from '../src/utils/diff-patch.js';
+import { KruschTelemetry } from '../src/brain/telemetry.js';
 
 const program = new Command();
 
@@ -31,8 +33,17 @@ program
 program
   .command('init')
   .description('Initialize environment, probe PostgreSQL connection, and apply schema migrations')
-  .action(async () => {
+  .option('--ephemeral', 'Initialize ephemeral in-process PostgreSQL database (zero setup)', false)
+  .action(async (options) => {
     console.log(chalk.bold.cyan('\n🚀 KRUSCH HARNESS INITIALIZATION (v0.1.0)\n'));
+
+    if (options.ephemeral) {
+      enableEphemeralMode();
+      console.log(chalk.bold.green('✓ Initialized ephemeral in-process PostgreSQL 16 (PGlite)'));
+      console.log(chalk.green('✓ All schema migrations applied in-process.'));
+      console.log(chalk.gray('  Run a mock task: ./bin/krusch.js run "your task" --mock --ephemeral\n'));
+      process.exit(0);
+    }
 
     const rootDir = path.resolve(__dirname, '..');
     const envPath = path.join(rootDir, '.env');
@@ -70,7 +81,7 @@ program
       console.log(chalk.yellow('\nTroubleshooting:'));
       console.log('  1. Ensure PostgreSQL is running: `docker compose up -d`');
       console.log('  2. Verify DATABASE_URL in .env matches your credentials');
-      console.log('  3. Or run with mock adapter: `./bin/krusch.js run "<goal>" --mock`\n');
+      console.log('  3. Or run in zero-setup ephemeral mode: `./bin/krusch.js run "<goal>" --mock --ephemeral`\n');
       process.exit(1);
     }
 
@@ -108,10 +119,15 @@ program
   .option('-a, --auto-approve', 'Automatically approve staged diffs and actions', false)
   .option('-c, --test-cmd <command>', 'Explicit ground-truth test/verification command override')
   .option('--mock', 'Run with local deterministic mock adapter (zero cloud API keys needed)', false)
+  .option('--ephemeral', 'Run with throwaway in-process PostgreSQL database (zero external setup)', false)
   .action(async (goal, options) => {
+    if (options.ephemeral) {
+      enableEphemeralMode();
+    }
+
     console.log(chalk.bold.cyan('\n⚡ KRUSCH CODING HARNESS ⚡'));
     console.log(chalk.gray(`Goal: "${goal}"`));
-    console.log(chalk.gray(`Substrate: PostgreSQL (${(process.env.DATABASE_URL || 'default').replace(/:[^:@]+@/, ':****@')})`));
+    console.log(chalk.gray(`Substrate: PostgreSQL (${options.ephemeral ? 'in-process PGlite WASM' : (process.env.DATABASE_URL || 'default').replace(/:[^:@]+@/, ':****@')})`));
     if (options.testCmd) {
       console.log(chalk.gray(`Test Command: "${options.testCmd}"`));
     }
@@ -210,7 +226,8 @@ program
 program
   .command('status <taskId>')
   .description('Inspect task execution details, turns, staged diffs, and verification trace from PostgreSQL')
-  .option('--trace', 'Print complete execution trace and invariant explanation', false)
+  .option('--trace', 'Print complete chronological event timeline', false)
+  .option('--json', 'Output complete OpenTelemetry-compatible JSON trace with cost ledger', false)
   .option('--export <file>', 'Export complete machine-readable execution trace to JSON file')
   .action(async (taskId, options) => {
     try {
@@ -219,6 +236,22 @@ program
         console.error(chalk.red(`Task not found: ${taskId}`));
         process.exit(1);
       }
+
+      // Query apply journal entries for this task
+      const journalRes = await query(
+        'SELECT id, state, files, created_at, completed_at, error_message FROM krusch_apply_journal WHERE task_id = $1 ORDER BY id ASC',
+        [taskId]
+      );
+
+      if (options.json) {
+        const trace = KruschTelemetry.buildTrace({
+          ...task,
+          applyJournals: journalRes.rows
+        });
+        console.log(JSON.stringify(trace, null, 2));
+        process.exit(0);
+      }
+
       console.log(chalk.bold.cyan(`\n📦 Task Status: ${task.id}`));
       console.log(`  Goal:          ${task.goal}`);
       console.log(`  Phase:         ${chalk.yellow(task.phase)}`);
@@ -231,11 +264,6 @@ program
       console.log(`  Approvals:     ${task.approvals.length}`);
       console.log(`  Verifications: ${task.verifications.length}`);
 
-      // Query apply journal entries for this task
-      const journalRes = await query(
-        'SELECT id, state, files, created_at, completed_at, error_message FROM krusch_apply_journal WHERE task_id = $1 ORDER BY id ASC',
-        [taskId]
-      );
       if (journalRes.rows.length > 0) {
         console.log(chalk.bold('\n  2PC Apply Journal:'));
         for (const j of journalRes.rows) {
@@ -244,36 +272,41 @@ program
         }
       }
 
+      // Default Status View: Transition Feasibility & Blockers with SQL Invariant Names
+      const explanation = await KruschStateManager.explainTaskStatus(taskId);
+      console.log(chalk.bold.cyan('\n🔍 State Feasibility & Invariant Invariants:'));
+      for (const t of explanation.possibleTransitions) {
+        const isBlocked = t.reason.startsWith('BLOCKED');
+        const prefix = isBlocked ? chalk.red('  ✗') : chalk.green('  ✓');
+        console.log(`${prefix} ${chalk.bold(`${t.from} ➔ ${t.to}`)}: ${isBlocked ? chalk.red(t.reason) : chalk.gray(t.reason)}`);
+      }
+
       // Query complete event timeline
       const eventsRes = await query(
         'SELECT id, event_type, payload, created_at FROM krusch_events WHERE task_id = $1 ORDER BY id ASC',
         [taskId]
       );
 
-      console.log(chalk.bold.cyan('\n⏱️ Chronological Event Timeline:'));
-      if (eventsRes.rows.length === 0) {
-        console.log(chalk.gray('  No events recorded.'));
-      } else {
-        for (const ev of eventsRes.rows) {
-          const time = new Date(ev.created_at).toISOString().slice(11, 19);
-          console.log(`  [${chalk.gray(time)}] ${chalk.bold.magenta(ev.event_type.padEnd(20))}: ${chalk.gray(JSON.stringify(ev.payload))}`);
-        }
-      }
-
       if (options.trace) {
-        const explanation = await KruschStateManager.explainTaskStatus(taskId);
-        console.log(chalk.bold.cyan('\n🔍 Detailed Invariant Diagnostic Trace:'));
+        console.log(chalk.bold.cyan('\n⏱️ Chronological Event Timeline:'));
+        if (eventsRes.rows.length === 0) {
+          console.log(chalk.gray('  No events recorded.'));
+        } else {
+          for (const ev of eventsRes.rows) {
+            const time = new Date(ev.created_at).toISOString().slice(11, 19);
+            console.log(`  [${chalk.gray(time)}] ${chalk.bold.magenta(ev.event_type.padEnd(20))}: ${chalk.gray(JSON.stringify(ev.payload))}`);
+          }
+        }
 
         if (explanation.latestVerification) {
           const lv = explanation.latestVerification;
           const statusStr = lv.passed ? chalk.green('PASSED (exit 0)') : chalk.red(`FAILED (exit ${lv.exitCode})`);
-          console.log(`  Latest Verification: ${statusStr}`);
-          console.log(`    Command: "${lv.command}"`);
+          console.log(chalk.bold('\n  Verification Run:'));
+          console.log(`    Status:   ${statusStr}`);
+          console.log(`    Command:  "${lv.command}"`);
           if (lv.failureModule) {
-            console.log(`    Attributed Module: ${chalk.magenta(lv.failureModule)}`);
+            console.log(`    Module:   ${chalk.magenta(lv.failureModule)}`);
           }
-        } else {
-          console.log(`  Latest Verification: ${chalk.gray('None recorded')}`);
         }
 
         if (task.stagedDiffs.length > 0) {
@@ -291,13 +324,6 @@ program
               console.log(`      Lease TTL: ${remaining > 0 ? `${remaining}s remaining` : chalk.red('EXPIRED')}`);
             }
           }
-        }
-
-        console.log(chalk.bold('\n  Transition Rules & Blockers:'));
-        for (const t of explanation.possibleTransitions) {
-          const isBlocked = t.reason.startsWith('BLOCKED');
-          const prefix = isBlocked ? chalk.red('  ✗') : chalk.green('  ✓');
-          console.log(`${prefix} ${chalk.bold(`${t.from} ➔ ${t.to}`)}: ${isBlocked ? chalk.red(t.reason) : chalk.gray(t.reason)}`);
         }
       }
 
@@ -352,7 +378,7 @@ program
 // 7. krusch diff
 program
   .command('diff <taskId>')
-  .description('Display or export unified diffs of all staged modifications for a task')
+  .description('Display or export PR-ready unified diffs of all staged modifications for a task')
   .option('-e, --export <filePath>', 'Export unified diff directly to a patch file')
   .action(async (taskId, options) => {
     try {
@@ -369,24 +395,19 @@ program
 
       let fullPatch = '';
       for (const diff of task.stagedDiffs) {
-        const origLines = (diff.original_content || '').split('\n');
-        const stagedLines = (diff.staged_content || '').split('\n');
-
-        fullPatch += `--- a/${diff.file_path}\n`;
-        fullPatch += `+++ b/${diff.file_path}\n`;
-        fullPatch += `@@ -1,${origLines.length} +1,${stagedLines.length} @@\n`;
-
-        for (const line of origLines) {
-          if (line) fullPatch += `-${line}\n`;
-        }
-        for (const line of stagedLines) {
-          if (line) fullPatch += `+${line}\n`;
+        const patchStr = generateUnifiedDiff(
+          diff.file_path,
+          diff.original_content || '',
+          diff.staged_content || ''
+        );
+        if (patchStr) {
+          fullPatch += patchStr;
         }
       }
 
       if (options.export) {
         fs.writeFileSync(options.export, fullPatch, 'utf-8');
-        console.log(chalk.green(`✓ Exported unified diff patch to ${options.export}`));
+        console.log(chalk.green(`✓ Exported PR-ready unified diff patch to ${options.export}`));
       } else {
         console.log(chalk.bold.cyan(`\n📝 Staged Diffs for Task ${taskId}:\n`));
         const lines = fullPatch.split('\n');
@@ -395,7 +416,7 @@ program
             console.log(chalk.green(line));
           } else if (line.startsWith('-') && !line.startsWith('---')) {
             console.log(chalk.red(line));
-          } else if (line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++')) {
+          } else if (line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++') || line.startsWith('diff --git')) {
             console.log(chalk.cyan(line));
           } else {
             console.log(line);
@@ -406,6 +427,64 @@ program
       process.exit(0);
     } catch (err) {
       console.error(chalk.red(`Error generating diff: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+// 8. krusch abort
+program
+  .command('abort <taskId>')
+  .description('Explicitly abort an active task and release all held file concurrency leases')
+  .option('-r, --reason <reason>', 'Rationale for aborting', 'Aborted by operator')
+  .action(async (taskId, options) => {
+    try {
+      const res = await KruschStateManager.abortTask(taskId, options.reason);
+      console.log(chalk.bold.yellow(`\n✓ Task ${res.taskId} transitioned to ABORTED.`));
+      console.log(`  Reason: ${chalk.gray(res.reason)}`);
+      console.log(chalk.green('  All associated file concurrency leases released.\n'));
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Error aborting task: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 9. krusch retry
+program
+  .command('retry <taskId>')
+  .description('Unstick and retry an aborted or failed task from a designated phase (PLAN, IMPLEMENT, VERIFY)')
+  .option('-p, --from <phase>', 'Phase to resume from', 'VERIFY')
+  .option('-r, --reason <reason>', 'Rationale for retry', 'Retried by operator')
+  .action(async (taskId, options) => {
+    try {
+      const res = await KruschStateManager.retryTask(taskId, options.from, options.reason);
+      console.log(chalk.bold.green(`\n✓ Task ${res.taskId} reset to phase: ${res.status}`));
+      console.log(`  Reason: ${chalk.gray(res.reason)}`);
+      console.log(chalk.gray('  Phase revisit counter reset to 0.\n'));
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Error retrying task: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 10. krusch reject
+program
+  .command('reject <taskId> [diffId]')
+  .description('Reject staged diffs for a task, preventing apply and releasing leases')
+  .option('-r, --reason <reason>', 'Rationale for rejection', 'Rejected by operator')
+  .action(async (taskId, diffId, options) => {
+    try {
+      const parsedDiffId = diffId ? parseInt(diffId, 10) : null;
+      const res = await KruschStateManager.rejectStagedDiff(taskId, parsedDiffId, options.reason);
+      console.log(chalk.bold.yellow(`\n✓ Marked staged diff(s) as REJECTED for task ${res.taskId}.`));
+      if (res.diffId) {
+        console.log(`  Diff ID: ${res.diffId}`);
+      }
+      console.log(`  Reason:  ${chalk.gray(res.reason)}\n`);
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Error rejecting diff: ${err.message}\n`));
       process.exit(1);
     }
   });

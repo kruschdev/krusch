@@ -95,6 +95,42 @@ export async function startMcpServer() {
             },
             required: ['taskId']
           }
+        },
+        {
+          name: 'krusch_explain',
+          description: 'Explain transition feasibility, invariant blockers, and ground-truth verification diagnostics for a task.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              taskId: { type: 'string', description: 'Task ID' }
+            },
+            required: ['taskId']
+          }
+        },
+        {
+          name: 'krusch_reject',
+          description: 'Reject one or all staged diffs for a task, preventing apply and releasing leases.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              taskId: { type: 'string', description: 'Task ID' },
+              diffId: { type: 'integer', description: 'Optional specific diff ID to reject' },
+              reason: { type: 'string', description: 'Rationale for rejection' }
+            },
+            required: ['taskId']
+          }
+        },
+        {
+          name: 'krusch_abort',
+          description: 'Explicitly abort an active or waiting task, releasing all file concurrency leases.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              taskId: { type: 'string', description: 'Task ID' },
+              reason: { type: 'string', description: 'Rationale for aborting' }
+            },
+            required: ['taskId']
+          }
         }
       ]
     };
@@ -200,6 +236,24 @@ export async function startMcpServer() {
           await KruschStateManager.updateTask(args.taskId, { phase: 'COMMITTED' });
         }
         return { content: [{ type: 'text', text: JSON.stringify(batchRes, null, 2) }] };
+      }
+
+      if (name === 'krusch_explain') {
+        const exp = await KruschStateManager.explainTaskStatus(args.taskId);
+        if (!exp) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(exp, null, 2) }] };
+      }
+
+      if (name === 'krusch_reject') {
+        const rejectRes = await KruschStateManager.rejectStagedDiff(args.taskId, args.diffId || null, args.reason || 'Rejected via MCP');
+        return { content: [{ type: 'text', text: JSON.stringify(rejectRes, null, 2) }] };
+      }
+
+      if (name === 'krusch_abort') {
+        const abortRes = await KruschStateManager.abortTask(args.taskId, args.reason || 'Aborted via MCP');
+        return { content: [{ type: 'text', text: JSON.stringify(abortRes, null, 2) }] };
       }
 
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);

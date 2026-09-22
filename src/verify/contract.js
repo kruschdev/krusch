@@ -3,6 +3,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { KruschTestRunner } from './test-runner.js';
+import { KruschSandbox } from './sandbox.js';
 
 export class KruschVerificationContract {
   /**
@@ -129,9 +130,21 @@ export class KruschVerificationContract {
         }
       }
 
-      // Run verification command inside sandbox
-      const result = await KruschTestRunner.runCommand(effectiveCommand, sandboxDir, { timeoutMs });
+      // Run verification command inside sandbox via KruschSandbox
+      const result = await KruschSandbox.run({
+        command: effectiveCommand,
+        cwd: sandboxDir,
+        stagedDir: sandboxDir,
+        stagedDiffs,
+        options: {
+          ...options,
+          allowedCommand: contract?.command,
+          verificationCommand: options.verificationCommand || contract?.command,
+          timeoutMs
+        }
+      });
       result.stagedTreeExecuted = true;
+      result.extractedErrors = KruschTestRunner.parseErrors(result.stdout, result.stderr);
       return result;
     } finally {
       // Clean up sandbox directory

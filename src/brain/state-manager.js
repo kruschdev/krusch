@@ -275,6 +275,25 @@ export class KruschStateManager {
       RETURNING *;
     `;
     const res = await query(sql, [taskId, targetProjectPath, canonicalFilePath, originalContent, stagedContent, diffPatch, hash, originalHash, ttlIntervalSql]);
+
+    // Store blobs into krusch_blobs for content-addressing & deduplication
+    try {
+      await query(
+        `INSERT INTO krusch_blobs (sha256, content, byte_size, created_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (sha256) DO NOTHING`,
+        [hash, stagedContent, Buffer.byteLength(stagedContent, 'utf-8')]
+      );
+      if (originalHash && originalContent) {
+        await query(
+          `INSERT INTO krusch_blobs (sha256, content, byte_size, created_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (sha256) DO NOTHING`,
+          [originalHash, originalContent, Buffer.byteLength(originalContent, 'utf-8')]
+        );
+      }
+    } catch (_) {}
+
     return res.rows[0];
   }
 
@@ -737,6 +756,7 @@ export class KruschStateManager {
       {
         from: 'PLAN',
         to: 'COMMITTED',
+        invariant: diffs.length > 0 ? 'INV_NO_SHORTCUT_COMMITS' : null,
         reason: diffs.length > 0
           ? `BLOCKED: Cannot shortcut from PLAN to COMMITTED while staged diffs exist. Staged modifications must proceed through IMPLEMENT -> VERIFY -> APPROVAL_GATE.`
           : 'ALLOWED: Read-only task with zero staged diffs.'
@@ -747,6 +767,7 @@ export class KruschStateManager {
       {
         from: 'VERIFY',
         to: 'APPROVAL_GATE',
+        invariant: (!latestVerif || !latestVerif.passed || latestVerif.exit_code !== 0) ? 'INV_VERIFY_PASSED' : null,
         reason: !latestVerif
           ? 'BLOCKED: Cannot transition from VERIFY to APPROVAL_GATE without running at least one verification test'
           : (!latestVerif.passed || latestVerif.exit_code !== 0)
@@ -758,6 +779,11 @@ export class KruschStateManager {
       {
         from: 'APPROVAL_GATE',
         to: 'COMMITTED',
+        invariant: (pendingDiffs.length > 0 || applyingDiffs.length > 0)
+          ? 'INV_NO_INCOMPLETE_COMMITS'
+          : diffs.some(d => d.status === 'REJECTED')
+            ? 'INV_NO_REJECTED_DIFFS'
+            : null,
         reason: (pendingDiffs.length > 0 || applyingDiffs.length > 0)
           ? `BLOCKED: Cannot transition from APPROVAL_GATE to COMMITTED while unapplied staged diffs remain PENDING`
           : diffs.some(d => d.status === 'REJECTED')
@@ -814,7 +840,8 @@ export class KruschStateManager {
     for (const t of exp.possibleTransitions) {
       const isBlocked = t.reason.startsWith('BLOCKED');
       const icon = isBlocked ? '✗ BLOCKED' : '✓ ALLOWED';
-      lines.push(`  ${icon} ${t.from} ➔ ${t.to}`);
+      const invTag = t.invariant ? ` [${t.invariant}]` : '';
+      lines.push(`  ${icon}${invTag} ${t.from} ➔ ${t.to}`);
       lines.push(`    ${t.reason}`);
     }
     return lines.join('\n');
@@ -894,12 +921,26 @@ export class KruschStateManager {
    * Locks the parent task row with SELECT ... FOR UPDATE inside a transaction
    * to serialize concurrent runners and prevent race conditions with phase transitions.
    */
-  static async recordVerificationRun(taskId, { command, exitCode, stdout, stderr, passed, failureModule = null, extractedErrors = [] }, client = null) {
+  static async recordVerificationRun(taskId, {
+    command,
+    exitCode,
+    stdout,
+    stderr,
+    passed,
+    failureModule = null,
+    extractedErrors = [],
+    sandboxType = 'process',
+    sandboxConfig = {},
+    envSnapshot = {},
+    fileManifest = [],
+    replayToken = null
+  }, client = null) {
     const insertSql = `
       INSERT INTO krusch_verification_runs (
-        task_id, command, exit_code, stdout, stderr, passed, failure_module, extracted_errors, created_at
+        task_id, command, exit_code, stdout, stderr, passed, failure_module, extracted_errors,
+        sandbox_type, sandbox_config, env_snapshot, file_manifest, replay_token, created_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
       RETURNING *;
     `;
     const params = [
@@ -910,7 +951,12 @@ export class KruschStateManager {
       stderr,
       passed,
       failureModule,
-      JSON.stringify(extractedErrors || [])
+      JSON.stringify(extractedErrors || []),
+      sandboxType || 'process',
+      JSON.stringify(sandboxConfig || {}),
+      JSON.stringify(envSnapshot || {}),
+      JSON.stringify(fileManifest || []),
+      replayToken || null
     ];
 
     if (client) {
@@ -1088,6 +1134,97 @@ export class KruschStateManager {
         metadata
       );
     });
+  }
+
+  /**
+   * Operator Action: Abort a task explicitly, release all held leases, and record event.
+   */
+  static async abortTask(taskId, reason = 'Aborted by operator') {
+    const task = await KruschStateManager.getTask(taskId);
+    if (!task) throw new Error(`Task '${taskId}' not found.`);
+
+    if (task.phase === 'COMMITTED') {
+      throw new Error(`Cannot abort task '${taskId}': task is already COMMITTED.`);
+    }
+
+    // Release leases on any pending or active diffs
+    await query(
+      `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
+      [taskId]
+    );
+
+    // Transition task to ABORTED
+    await query(
+      `UPDATE krusch_tasks SET phase = 'ABORTED', metadata = metadata || $1::jsonb, updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify({ abortReason: reason, abortedBy: 'operator', abortedAt: new Date().toISOString() }), taskId]
+    );
+
+    await KruschStateManager.recordEvent(taskId, null, 'operator_abort', {
+      previousPhase: task.phase,
+      reason
+    });
+
+    return { taskId, status: 'ABORTED', reason };
+  }
+
+  /**
+   * Operator Action: Retry a failed or aborted task from a designated phase (VERIFY or IMPLEMENT).
+   */
+  static async retryTask(taskId, fromPhase = 'VERIFY', reason = 'Retried by operator') {
+    const validPhases = ['PLAN', 'IMPLEMENT', 'VERIFY'];
+    if (!validPhases.includes(fromPhase)) {
+      throw new Error(`Invalid retry phase '${fromPhase}'. Allowed phases: ${validPhases.join(', ')}`);
+    }
+
+    const task = await KruschStateManager.getTask(taskId);
+    if (!task) throw new Error(`Task '${taskId}' not found.`);
+
+    if (task.phase === 'COMMITTED') {
+      throw new Error(`Cannot retry task '${taskId}': task is already COMMITTED to physical disk.`);
+    }
+
+    // Reset phase revisits and re-open diffs if retrying
+    await query(
+      `UPDATE krusch_tasks
+       SET phase = $1, phase_revisits = 0, metadata = metadata || $2::jsonb, updated_at = NOW()
+       WHERE id = $3`,
+      [fromPhase, JSON.stringify({ retryReason: reason, retriedBy: 'operator', retriedAt: new Date().toISOString() }), taskId]
+    );
+
+    await KruschStateManager.recordEvent(taskId, null, 'operator_retry', {
+      previousPhase: task.phase,
+      newPhase: fromPhase,
+      reason
+    });
+
+    return { taskId, status: fromPhase, reason };
+  }
+
+  /**
+   * Operator Action: Explicitly reject one or all staged diffs for a task.
+   */
+  static async rejectStagedDiff(taskId, diffId = null, reason = 'Rejected by operator') {
+    const task = await KruschStateManager.getTask(taskId);
+    if (!task) throw new Error(`Task '${taskId}' not found.`);
+
+    if (diffId) {
+      await query(
+        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE id = $1 AND task_id = $2`,
+        [diffId, taskId]
+      );
+    } else {
+      await query(
+        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status = 'PENDING'`,
+        [taskId]
+      );
+    }
+
+    await KruschStateManager.recordEvent(taskId, null, 'operator_reject_diff', {
+      diffId,
+      reason
+    });
+
+    return { taskId, diffId, status: 'REJECTED', reason };
   }
 }
 

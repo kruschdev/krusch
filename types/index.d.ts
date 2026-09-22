@@ -11,6 +11,12 @@ export interface TaskRecord {
   current_model: string | null;
   metadata: Record<string, any>;
   verification_command?: string | null;
+  budget_turns?: number;
+  budget_tokens?: number;
+  max_phase_revisits?: number;
+  used_turns?: number;
+  used_tokens?: number;
+  phase_revisits?: Record<string, number>;
   created_at: string;
   updated_at: string;
   turns?: TurnRecord[];
@@ -87,6 +93,11 @@ export interface VerificationRunRecord {
   passed: boolean;
   failure_module: string | null;
   extracted_errors: any[];
+  sandbox_type?: string | null;
+  replay_token?: string | null;
+  sandbox_config?: any;
+  env_snapshot?: any;
+  file_manifest?: any;
   created_at: string;
   duration_ms?: number;
 }
@@ -230,6 +241,12 @@ export class KruschStateManager {
     guardValidator?: (ctx: { task: TaskRecord; client: any; targetPhase: HarnessPhase }) => Promise<void>,
     metadata?: Record<string, any>
   ): Promise<{ from: HarnessPhase; to: HarnessPhase; task: TaskRecord }>;
+
+  static abortTask(taskId: string, reason?: string): Promise<{ task: TaskRecord; reason: string }>;
+
+  static retryTask(taskId: string, options?: { fromPhase?: HarnessPhase; reason?: string }): Promise<{ task: TaskRecord; transitionedFrom: HarnessPhase }>;
+
+  static rejectStagedDiff(taskId: string, diffId?: number | null, reason?: string): Promise<{ rejectedCount: number; diffs: StagedDiffRecord[] }>;
 }
 
 export interface RouteResult {
@@ -401,3 +418,57 @@ export class DefaultKruschRouter {
 }
 
 export function startMcpServer(): Promise<void>;
+
+export interface SandboxExecutionResult {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  passed: boolean;
+  durationMs: number;
+  sandboxType: 'bwrap' | 'process-jail';
+  replayToken: string;
+}
+
+export class KruschSandbox {
+  static isBwrapAvailable(): boolean;
+  static validateCapability(command: string): { allowed: boolean; reason?: string };
+  static computeReplayToken(params: { command: string; env?: Record<string, string>; stagedTreePath: string; stagedDiffs?: any[] }): string;
+  static runInSandbox(params: {
+    command: string;
+    cwd: string;
+    env?: Record<string, string>;
+    timeoutMs?: number;
+    maxBufferBytes?: number;
+    stagedDiffs?: any[];
+  }): Promise<SandboxExecutionResult>;
+}
+
+export class KruschTelemetry {
+  static buildTrace(taskId: string): Promise<{
+    traceId: string;
+    task: any;
+    spans: Array<{
+      name: string;
+      phase?: string;
+      durationMs: number;
+      attributes: Record<string, any>;
+    }>;
+    costLedger: {
+      totalTokens: number;
+      estimatedCostUsd: number;
+      l1CpuFastPaths: number;
+      modelBreakdown: Record<string, any>;
+    };
+  }>;
+}
+
+export function generateUnifiedDiff(filePath: string, originalContent: string | null, newContent: string): string;
+
+export function enableEphemeralMode(): void;
+export function disableEphemeralMode(): void;
+export function isEphemeralMode(): boolean;
+export function closePool(): Promise<void>;
+export const pool: any;
+export function query(text: string, params?: any[], options?: { silent?: boolean }): Promise<any>;
+export function withTransaction<T = any>(callback: (client: any) => Promise<T>): Promise<T>;

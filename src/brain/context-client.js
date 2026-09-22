@@ -32,6 +32,82 @@ export class KruschContextClient {
   }
 
   /**
+   * Assemble task-scoped context focused strictly on:
+   * 1. Files modified in staged diffs.
+   * 2. Failing test locations (error locations).
+   * 3. Task symbols snapshotted in krusch_task_symbols.
+   */
+  static async assembleTaskContext(taskId, projectPath, options = {}) {
+    let stagedFiles = [];
+    try {
+      const stagedRows = await query(
+        'SELECT file_path FROM krusch_staged_diffs WHERE task_id = $1 ORDER BY id ASC',
+        [taskId],
+        { silent: true }
+      );
+      stagedFiles = (stagedRows.rows || []).map(r => r.file_path);
+    } catch (_) {}
+
+    // Get failing test locations
+    const errorFiles = [];
+    try {
+      const verifRows = await query(
+        'SELECT extracted_errors FROM krusch_verification_runs WHERE task_id = $1 ORDER BY id DESC LIMIT 1',
+        [taskId],
+        { silent: true }
+      );
+      if (verifRows.rows?.[0]?.extracted_errors) {
+        const errs = Array.isArray(verifRows.rows[0].extracted_errors)
+          ? verifRows.rows[0].extracted_errors
+          : [];
+        for (const e of errs) {
+          if (e.file && !errorFiles.includes(e.file)) {
+            errorFiles.push(e.file);
+          }
+        }
+      }
+    } catch (_) {}
+
+    const scopedFiles = Array.from(new Set([...stagedFiles, ...errorFiles]));
+
+    // Snapshot symbols for scoped files into krusch_task_symbols
+    if (scopedFiles.length > 0) {
+      try {
+        await KruschSymbolIndexer.snapshotTaskSymbols(taskId, projectPath, scopedFiles);
+      } catch (_) {}
+    }
+
+    // Query task symbols first
+    let symbols = [];
+    try {
+      const symRes = await query(
+        'SELECT file_path, symbol_name, symbol_type, start_line, end_line, signature FROM krusch_task_symbols WHERE task_id = $1 ORDER BY file_path, start_line ASC',
+        [taskId],
+        { silent: true }
+      );
+      if (symRes.rows?.length > 0) {
+        symbols = symRes.rows;
+      }
+    } catch (_) {}
+
+    // Fallback if no task symbols yet
+    if (symbols.length === 0 && options.queryText) {
+      symbols = await KruschContextClient.searchCodeSymbols(options.queryText, 10);
+    }
+
+    const recentMemories = await KruschContextClient.getRecentMemories(5);
+    const formattedSymbols = KruschContextClient.formatSymbols(symbols);
+
+    return {
+      scopedFiles,
+      symbols,
+      memories: recentMemories,
+      formattedSymbols,
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  /**
    * Format a list of relative file paths into a structured, token-bounded tree.
    */
   static formatRepoTree(files, maxLines = 30) {
@@ -105,7 +181,7 @@ ${memoryLines}`;
         ORDER BY LENGTH(symbol_name) ASC
         LIMIT $2;
       `;
-      const res = await query(legacySql, [`%${queryTerm.trim()}%`, limit]);
+      const res = await query(legacySql, [`%${queryTerm.trim()}%`, limit], { silent: true });
       return res.rows;
     } catch (_) {
       return [];
@@ -137,7 +213,7 @@ ${memoryLines}`;
         ORDER BY created_at DESC
         LIMIT $1;
       `;
-      const res = await query(legacySql, [limit]);
+      const res = await query(legacySql, [limit], { silent: true });
       return res.rows;
     } catch (_) {
       return [];

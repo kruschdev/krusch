@@ -273,7 +273,10 @@ export class KruschTools {
       const result = await KruschVerificationContract.runInStagedTree(
         this.projectPath,
         pendingDiffs,
-        { command: args.command }
+        {
+          command: args.command,
+          verificationCommand: this.verificationCommand
+        }
       );
       await KruschStateManager.recordVerificationRun(this.taskId, {
         command: args.command,
@@ -281,7 +284,12 @@ export class KruschTools {
         stdout: result.stdout,
         stderr: result.stderr,
         passed: result.passed,
-        extractedErrors: result.extractedErrors || []
+        extractedErrors: result.extractedErrors || [],
+        sandboxType: result.sandboxType || 'process',
+        sandboxConfig: result.sandboxConfig || {},
+        envSnapshot: result.envSnapshot || {},
+        fileManifest: result.fileManifest || [],
+        replayToken: result.replayToken || null
       });
       return result;
     }

@@ -45,6 +45,7 @@
     "url": "https://github.com/kruschdev/krusch/issues"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@modelcontextprotocol/sdk": "^1.6.0",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
