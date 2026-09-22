@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
   <a href="https://github.com/kruschdev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
-  <img src="https://img.shields.io/badge/tests-79%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-78%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 > **Core Thesis**: *Models are ephemeral compute; PostgreSQL is the brain. Keep workflow, context, tests, and approvals consistent while making models interchangeable.*
@@ -227,7 +227,7 @@ npm run test:unit
 # Run storage engine property & PostgreSQL integration tests
 npm run test:integration
 
-# Run full test suite (79 tests across unit, integration, and ephemeral)
+# Run full test suite (78 tests across unit, integration, and ephemeral)
 npm test
 
 # Verify TypeScript declarations (zero errors)
@@ -246,6 +246,8 @@ To preserve reliability and prevent architectural bloat:
 2. **No required external routers**: Routing is decoupled behind `src/router/interface.js`. The in-tree heuristic gate runs with zero external dependencies.
 3. **No direct disk mutations**: All mutations must proceed through `stage_diff -> sandboxed VERIFY -> APPROVAL_GATE -> 2PC apply`.
 4. **No shell execution in IMPLEMENT**: Freeform shell commands (`run_command`) are strictly forbidden during `PLAN` and `IMPLEMENT` phases.
+5. **No unconstrained agent loops**: Phase revisit budgets cap oscillation between `VERIFY` and `IMPLEMENT` to prevent runaway spending, automatically escalating or aborting tasks that do not converge.
+6. **No client-side state authority**: Ephemeral model context windows cannot override database invariants; PostgreSQL triggers, row locks, lease TTLs, and transitions are the sole source of truth.
 
 ---
 

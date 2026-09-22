@@ -102,6 +102,25 @@ export interface VerificationRunRecord {
   duration_ms?: number;
 }
 
+export interface KruschBlobRecord {
+  sha256: string;
+  content: string;
+  byte_size: number;
+  created_at: string;
+}
+
+export interface TaskSymbolRecord {
+  id: number;
+  task_id: string;
+  file_path: string;
+  symbol_name: string;
+  symbol_type?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+  signature?: string | null;
+  created_at: string;
+}
+
 export function canonicalizePaths(projectPath: string, filePath: string): { projectPath: string; filePath: string };
 
 export class KruschFSM {
@@ -348,6 +367,7 @@ export class KruschApprovalPolicy {
 export class KruschSymbolIndexer {
   static indexProject(projectPath: string, options?: { maxFiles?: number }): Promise<{ filesScanned: number; symbolsIndexed: number }>;
   static extractSymbolsFromFile(filePath: string, relativePath: string, projectPath: string): any[];
+  static snapshotTaskSymbols(taskId: string, projectPath: string, filePaths?: string[]): Promise<number>;
 }
 
 export class KruschContextClient {
