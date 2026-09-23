@@ -12,7 +12,7 @@ import {
 import { KruschStateMachine } from '../workflow/state-machine.js';
 import { KruschStateManager } from '../brain/state-manager.js';
 import { KruschFSM, HARNESS_PHASES } from '../workflow/fsm.js';
-import { query } from '../brain/pool.js';
+import { query, pool } from '../brain/pool.js';
 import crypto from 'crypto';
 
 /**
@@ -283,6 +283,15 @@ export async function startMcpServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[krusch:mcp] Krusch MCP Server connected over stdio');
+
+  const shutdown = async () => {
+    console.error('[krusch:mcp] Shutting down...');
+    try { await pool.end(); } catch (_) { }
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.stdin.on('close', shutdown);
 }
 
 if (process.argv[1] && process.argv[1].endsWith('mcp-server.js')) {
