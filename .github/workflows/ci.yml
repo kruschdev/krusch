@@ -23,6 +23,17 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run test:unit
+      - name: Instant Failure Push Notification
+        if: failure()
+        run: |
+          curl -s -X POST \
+            -H "Title: 🚨 CI Failure: ${{ github.repository }} (Unit Tests - Node ${{ matrix.node-version }})" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light,x" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
+            https://ntfy.sh/krusch-ci-alerts || true
+
 
   integration-tests:
     name: PostgreSQL Integration Tests
@@ -62,6 +73,17 @@ jobs:
             node --test "$f" || { echo "::error file=$f::Integration test failed in $f"; exit 1; }
             echo "::endgroup::"
           done
+      - name: Instant Failure Push Notification
+        if: failure()
+        run: |
+          curl -s -X POST \
+            -H "Title: 🚨 CI Failure: ${{ github.repository }} (Integration Tests - PostgreSQL)" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light,x" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
+            https://ntfy.sh/krusch-ci-alerts || true
+
 
   typecheck:
     name: Typecheck & Packaging Dry Run
@@ -76,3 +98,14 @@ jobs:
       - run: npm run typecheck
       - name: Verify Publish Dry Run
         run: npm pack --dry-run
+      - name: Instant Failure Push Notification
+        if: failure()
+        run: |
+          curl -s -X POST \
+            -H "Title: 🚨 CI Failure: ${{ github.repository }} (Typecheck & Pack)" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light,x" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
+            https://ntfy.sh/krusch-ci-alerts || true
+
