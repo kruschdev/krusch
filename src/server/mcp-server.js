@@ -1,5 +1,6 @@
-#!/usr/bin/env node
-
+import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -13,39 +14,27 @@ import { KruschStateMachine } from '../workflow/state-machine.js';
 import { KruschStateManager } from '../brain/state-manager.js';
 import { KruschFSM, HARNESS_PHASES } from '../workflow/fsm.js';
 import { query, pool } from '../brain/pool.js';
-import crypto from 'crypto';
 
 /**
- * Krusch MCP Server
- *
- * Exposes a thin, 7-tool async control plane interface for KD Code / IDEs:
- * 1. krusch_run: Non-blocking asynchronous task dispatch.
- * 2. krusch_task_status: Polling status endpoint with event timeline and verification state.
- * 3. krusch_diff: Unified diff inspector for staged modifications in PostgreSQL.
- * 4. krusch_apply_diff: Human approval trigger to 2PC journal and write working tree.
- * 5. krusch_explain: Invariant blocker diagnostics & transition feasibility.
- * 6. krusch_reject: Reject staged diffs and release file concurrency leases.
- * 7. krusch_abort: Explicitly abort task and unlock working tree leases.
+ * Factory function creating and configuring the Krusch MCP Server instance.
+ * Allows in-memory testing without spawning stdio child processes.
  */
-export async function startMcpServer() {
-  // Startup Crash Recovery & Lease Maintenance for long-lived MCP server
-  try {
-    const recovered = await KruschStateManager.recoverInFlightApplies();
-    if (recovered.length > 0) {
-      console.error(`[krusch:mcp] Recovered ${recovered.length} in-flight diff apply operation(s)`);
-    }
-    const pruned = await KruschStateManager.pruneExpiredLeases();
-    if (pruned.length > 0) {
-      console.error(`[krusch:mcp] Pruned ${pruned.length} expired file lease(s)`);
-    }
-  } catch (err) {
-    console.error(`[krusch:mcp] Startup recovery warning: ${err.message}`);
-  }
-
+export function createMcpServer() {
   const server = new Server(
     { name: 'krusch-harness', version: '0.1.0' },
     { capabilities: { tools: {} } }
   );
+
+  const activeTasks = new Map();
+  server.activeTasks = activeTasks;
+
+  const originalClose = server.close.bind(server);
+  server.close = async () => {
+    if (activeTasks.size > 0) {
+      await Promise.allSettled(Array.from(activeTasks.values()));
+    }
+    return originalClose();
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
@@ -140,37 +129,71 @@ export async function startMcpServer() {
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+    const { name, arguments: args = {} } = request.params;
 
     try {
       if (name === 'krusch_run') {
+        if (!args.goal || typeof args.goal !== 'string' || args.goal.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'goal' must be a non-empty string");
+        }
+        if (args.goal.length > 50000) {
+          throw new McpError(ErrorCode.InvalidParams, "'goal' exceeds maximum allowed length of 50,000 characters");
+        }
+
+        let projectPath = process.cwd();
+        if (args.projectPath) {
+          if (typeof args.projectPath !== 'string' || args.projectPath.trim().length === 0) {
+            throw new McpError(ErrorCode.InvalidParams, "'projectPath' must be a non-empty string path");
+          }
+          const resolved = path.resolve(args.projectPath);
+          if (!fs.existsSync(resolved)) {
+            throw new McpError(ErrorCode.InvalidParams, `Directory not found for projectPath: ${args.projectPath}`);
+          }
+          try {
+            const stat = fs.statSync(resolved);
+            if (!stat.isDirectory()) {
+              throw new McpError(ErrorCode.InvalidParams, `Target projectPath is not a directory: ${args.projectPath}`);
+            }
+          } catch (e) {
+            throw new McpError(ErrorCode.InvalidParams, `Cannot access projectPath: ${e.message}`);
+          }
+          projectPath = resolved;
+        }
+
         const taskId = `task_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-        const projectPath = args.projectPath || process.cwd();
+        const autoApprove = Boolean(args.autoApprove);
+        const useMock = Boolean(args.useMock);
+        const modelOverride = (typeof args.modelOverride === 'string' && args.modelOverride.trim()) ? args.modelOverride.trim() : null;
 
         // Initialize task record synchronously so taskId is immediately valid
         await KruschStateManager.createTask({
           id: taskId,
-          goal: args.goal,
+          goal: args.goal.trim(),
           projectPath,
           phase: 'INIT'
         });
 
         // Launch execution asynchronously in background (non-blocking for stdio transport)
         const harness = new KruschStateMachine({
-          autoApprove: Boolean(args.autoApprove),
-          useMock: Boolean(args.useMock),
-          simulateMockTrajectory: Boolean(args.useMock),
-          pinnedModel: args.modelOverride || null
+          autoApprove,
+          useMock,
+          simulateMockTrajectory: useMock,
+          pinnedModel: modelOverride
         });
 
-        harness.runTask({
+        const taskPromise = harness.runTask({
           taskId,
-          goal: args.goal,
+          goal: args.goal.trim(),
           projectPath,
-          modelOverride: args.modelOverride,
-          autoApprove: Boolean(args.autoApprove)
+          modelOverride,
+          autoApprove
         }).catch(err => {
           console.error(`[krusch:mcp] Background execution error for ${taskId}: ${err.message}`);
+        });
+
+        activeTasks.set(taskId, taskPromise);
+        taskPromise.finally(() => {
+          activeTasks.delete(taskId);
         });
 
         return {
@@ -187,15 +210,19 @@ export async function startMcpServer() {
       }
 
       if (name === 'krusch_task_status') {
-        const task = await KruschStateManager.getTask(args.taskId);
+        if (!args.taskId || typeof args.taskId !== 'string' || args.taskId.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'taskId' must be a non-empty string");
+        }
+        const taskId = args.taskId.trim();
+        const task = await KruschStateManager.getTask(taskId);
         if (!task) {
-          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
         }
 
         // Fetch recent events for timeline
         const eventsRes = await query(
           'SELECT event_type, payload, created_at FROM krusch_events WHERE task_id = $1 ORDER BY id DESC LIMIT 10',
-          [args.taskId]
+          [taskId]
         );
 
         const statusReport = {
@@ -218,9 +245,13 @@ export async function startMcpServer() {
       }
 
       if (name === 'krusch_diff') {
-        const task = await KruschStateManager.getTask(args.taskId);
+        if (!args.taskId || typeof args.taskId !== 'string' || args.taskId.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'taskId' must be a non-empty string");
+        }
+        const taskId = args.taskId.trim();
+        const task = await KruschStateManager.getTask(taskId);
         if (!task) {
-          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
         }
         const diffs = task.stagedDiffs.map(d => ({
           id: d.id,
@@ -234,45 +265,80 @@ export async function startMcpServer() {
       }
 
       if (name === 'krusch_apply_diff') {
-        const task = await KruschStateManager.getTask(args.taskId);
+        if (!args.taskId || typeof args.taskId !== 'string' || args.taskId.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'taskId' must be a non-empty string");
+        }
+        if (args.diffId !== undefined && args.diffId !== null && (!Number.isInteger(args.diffId) || args.diffId <= 0)) {
+          throw new McpError(ErrorCode.InvalidParams, "'diffId' must be a positive integer");
+        }
+        const taskId = args.taskId.trim();
+        const task = await KruschStateManager.getTask(taskId);
         if (!task) {
-          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
         }
 
         const diffIds = args.diffId ? [args.diffId] : null;
-        const batchRes = await KruschStateManager.applyDiffBatch(args.taskId, diffIds, task.project_path || process.cwd());
-        const remainingPending = await KruschStateManager.getPendingDiffs(args.taskId);
+        const batchRes = await KruschStateManager.applyDiffBatch(taskId, diffIds, task.project_path || process.cwd());
+        const remainingPending = await KruschStateManager.getPendingDiffs(taskId);
         if (remainingPending.length === 0) {
           try {
-            const fsm = new KruschFSM(args.taskId, task.phase);
+            const fsm = new KruschFSM(taskId, task.phase);
             await fsm.transitionTo(HARNESS_PHASES.COMMITTED);
           } catch (_) {
-            await KruschStateManager.updateTask(args.taskId, { phase: HARNESS_PHASES.COMMITTED });
+            await KruschStateManager.updateTask(taskId, { phase: HARNESS_PHASES.COMMITTED });
           }
         }
         return { content: [{ type: 'text', text: JSON.stringify(batchRes, null, 2) }] };
       }
 
       if (name === 'krusch_explain') {
-        const exp = await KruschStateManager.explainTaskStatus(args.taskId);
+        if (!args.taskId || typeof args.taskId !== 'string' || args.taskId.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'taskId' must be a non-empty string");
+        }
+        const taskId = args.taskId.trim();
+        const exp = await KruschStateManager.explainTaskStatus(taskId);
         if (!exp) {
-          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${args.taskId}`);
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
         }
         return { content: [{ type: 'text', text: JSON.stringify(exp, null, 2) }] };
       }
 
       if (name === 'krusch_reject') {
-        const rejectRes = await KruschStateManager.rejectStagedDiff(args.taskId, args.diffId || null, args.reason || 'Rejected via MCP');
+        if (!args.taskId || typeof args.taskId !== 'string' || args.taskId.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'taskId' must be a non-empty string");
+        }
+        if (args.diffId !== undefined && args.diffId !== null && (!Number.isInteger(args.diffId) || args.diffId <= 0)) {
+          throw new McpError(ErrorCode.InvalidParams, "'diffId' must be a positive integer");
+        }
+        const taskId = args.taskId.trim();
+        const task = await KruschStateManager.getTask(taskId);
+        if (!task) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
+        }
+        const reason = (typeof args.reason === 'string' && args.reason.trim()) ? args.reason.trim() : 'Rejected via MCP';
+        const rejectRes = await KruschStateManager.rejectStagedDiff(taskId, args.diffId || null, reason);
         return { content: [{ type: 'text', text: JSON.stringify(rejectRes, null, 2) }] };
       }
 
       if (name === 'krusch_abort') {
-        const abortRes = await KruschStateManager.abortTask(args.taskId, args.reason || 'Aborted via MCP');
+        if (!args.taskId || typeof args.taskId !== 'string' || args.taskId.trim().length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'taskId' must be a non-empty string");
+        }
+        const taskId = args.taskId.trim();
+        const task = await KruschStateManager.getTask(taskId);
+        if (!task) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
+        }
+        const reason = (typeof args.reason === 'string' && args.reason.trim()) ? args.reason.trim() : 'Aborted via MCP';
+        const abortRes = await KruschStateManager.abortTask(taskId, reason);
         return { content: [{ type: 'text', text: JSON.stringify(abortRes, null, 2) }] };
       }
 
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     } catch (err) {
+      if (err instanceof McpError) {
+        throw err;
+      }
       return {
         isError: true,
         content: [{ type: 'text', text: `Krusch Error: ${err.message}` }]
@@ -280,18 +346,52 @@ export async function startMcpServer() {
     }
   });
 
+  return server;
+}
+
+/**
+ * Krusch MCP Server CLI runner
+ *
+ * Exposes a thin, 7-tool async control plane interface for KD Code / IDEs:
+ * 1. krusch_run: Non-blocking asynchronous task dispatch.
+ * 2. krusch_task_status: Polling status endpoint with event timeline and verification state.
+ * 3. krusch_diff: Unified diff inspector for staged modifications in PostgreSQL.
+ * 4. krusch_apply_diff: Human approval trigger to 2PC journal and write working tree.
+ * 5. krusch_explain: Invariant blocker diagnostics & transition feasibility.
+ * 6. krusch_reject: Reject staged diffs and release file concurrency leases.
+ * 7. krusch_abort: Explicitly abort task and unlock working tree leases.
+ */
+export async function startMcpServer() {
+  // Startup Crash Recovery & Lease Maintenance for long-lived MCP server
+  try {
+    const recovered = await KruschStateManager.recoverInFlightApplies();
+    if (recovered.length > 0) {
+      console.error(`[krusch:mcp] Recovered ${recovered.length} in-flight diff apply operation(s)`);
+    }
+    const pruned = await KruschStateManager.pruneExpiredLeases();
+    if (pruned.length > 0) {
+      console.error(`[krusch:mcp] Pruned ${pruned.length} expired file lease(s)`);
+    }
+  } catch (err) {
+    console.error(`[krusch:mcp] Startup recovery warning: ${err.message}`);
+  }
+
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('[krusch:mcp] Krusch MCP Server connected over stdio');
 
   const shutdown = async () => {
     console.error('[krusch:mcp] Shutting down...');
+    try { await server.close(); } catch (_) { }
     try { await pool.end(); } catch (_) { }
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
   process.stdin.on('close', shutdown);
+
+  return server;
 }
 
 if (process.argv[1] && process.argv[1].endsWith('mcp-server.js')) {

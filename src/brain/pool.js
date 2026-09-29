@@ -68,6 +68,10 @@ export function getPool() {
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 5000,
     });
+    // Guard against uncaught idle client crashes (e.g. Postgres restart or network drops)
+    activePool.on('error', (err) => {
+      console.error('[krusch:db] PostgreSQL pool idle client error:', err.message);
+    });
   }
   return activePool;
 }

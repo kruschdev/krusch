@@ -197,6 +197,9 @@ export class KruschTools {
     }
 
     if (name === 'read_file') {
+      if (!args.path || typeof args.path !== 'string') {
+        return { error: 'Invalid path: file path must be a non-empty string.' };
+      }
       const { projectPath, filePath } = canonicalizePaths(this.projectPath, args.path);
       const fullPath = path.resolve(projectPath, filePath);
       if (!fs.existsSync(fullPath)) {
