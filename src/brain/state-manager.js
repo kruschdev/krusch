@@ -131,6 +131,17 @@ export class KruschStateManager {
       RETURNING *;
     `;
     const res = await query(sql, values);
+    if (phase === 'COMMITTED') {
+      await query(
+        `UPDATE krusch_staged_diffs SET status = 'COMMITTED' WHERE task_id = $1 AND status = 'APPLIED'`,
+        [taskId]
+      );
+    } else if (phase === 'ABORTED') {
+      await query(
+        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
+        [taskId]
+      );
+    }
     return res.rows[0];
   }
 
@@ -304,7 +315,11 @@ export class KruschStateManager {
     const res = await query(`
       UPDATE krusch_staged_diffs
       SET status = 'REJECTED'
-      WHERE status = 'PENDING' AND lease_expires_at < NOW()
+      WHERE status IN ('PENDING', 'APPLIED')
+        AND (
+          lease_expires_at < NOW()
+          OR (lease_expires_at IS NULL AND created_at < NOW() - INTERVAL '15 minutes')
+        )
       RETURNING id, task_id, file_path, project_path, lease_expires_at;
     `);
 

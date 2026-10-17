@@ -15,3 +15,13 @@ export { KruschSandbox } from './verify/sandbox.js';
 export { KruschTelemetry } from './brain/telemetry.js';
 export { generateUnifiedDiff } from './utils/diff-patch.js';
 export { enableEphemeralMode, disableEphemeralMode, isEphemeralMode, closePool, query, withTransaction, pool } from './brain/pool.js';
+export {
+  redactSecrets,
+  routePipeline,
+  runDoctor,
+  startBridgeServer,
+  runHeadlessCi,
+  runVerifyModels,
+  runInvariantDemo,
+  runBenchmark,
+} from './control/control-plane.js';

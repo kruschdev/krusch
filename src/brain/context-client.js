@@ -150,7 +150,11 @@ ${context.formattedSymbols}`;
 ${memoryLines}`;
     }
 
-    return block;
+    return block
+      .replace(/sk-ant-[a-zA-Z0-9_-]{20,}/g, '[REDACTED_ANTHROPIC_KEY]')
+      .replace(/sk-[a-zA-Z0-9_-]{20,}/g, '[REDACTED_API_KEY]')
+      .replace(/AIza[a-zA-Z0-9_-]{35}/g, '[REDACTED_GEMINI_KEY]')
+      .replace(/(postgres(?:ql)?:\/\/[^:]+:)([^@]+)(@[^/]+\/[^?\s]+)/gi, '$1****$3');
   }
 
   /**

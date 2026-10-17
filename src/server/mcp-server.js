@@ -42,6 +42,12 @@ export function createMcpServer() {
         {
           name: 'krusch_run',
           description: 'Asynchronously launch an engineering task in the Krusch harness. Returns immediately with taskId for polling.',
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: true
+          },
           inputSchema: {
             type: 'object',
             properties: {
@@ -57,6 +63,12 @@ export function createMcpServer() {
         {
           name: 'krusch_task_status',
           description: 'Poll real-time task status, phase transitions, latest verification, and recent events from PostgreSQL.',
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+          },
           inputSchema: {
             type: 'object',
             properties: {
@@ -67,7 +79,13 @@ export function createMcpServer() {
         },
         {
           name: 'krusch_diff',
-          description: 'Inspect unified diffs of all staged modifications held in PostgreSQL for review in KD Code.',
+          description: 'Inspect unified diffs of all staged modifications held in PostgreSQL for review in Krusch Control Plane.',
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+          },
           inputSchema: {
             type: 'object',
             properties: {
@@ -79,6 +97,12 @@ export function createMcpServer() {
         {
           name: 'krusch_apply_diff',
           description: 'Approve and apply verified staged diffs from PostgreSQL to physical disk via 2PC apply journal.',
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: true,
+            openWorldHint: false
+          },
           inputSchema: {
             type: 'object',
             properties: {
@@ -91,6 +115,12 @@ export function createMcpServer() {
         {
           name: 'krusch_explain',
           description: 'Explain transition feasibility, invariant blockers, and ground-truth verification diagnostics for a task.',
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+          },
           inputSchema: {
             type: 'object',
             properties: {
@@ -102,6 +132,12 @@ export function createMcpServer() {
         {
           name: 'krusch_reject',
           description: 'Reject one or all staged diffs for a task, preventing apply and releasing leases.',
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: true,
+            openWorldHint: false
+          },
           inputSchema: {
             type: 'object',
             properties: {
@@ -115,6 +151,12 @@ export function createMcpServer() {
         {
           name: 'krusch_abort',
           description: 'Explicitly abort an active or waiting task, releasing all file concurrency leases.',
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: true,
+            openWorldHint: false
+          },
           inputSchema: {
             type: 'object',
             properties: {

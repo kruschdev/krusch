@@ -234,8 +234,11 @@ test('Integration E2E: Harness executes real repo edit end-to-end (run -> fail t
     recordedAt: new Date().toISOString()
   };
 
+  const dynamicCapturePath = path.join(testDir, 'e2e-run-capture.json');
+  fs.writeFileSync(dynamicCapturePath, JSON.stringify(fixtureData, null, 2), 'utf-8');
+  assert.ok(fs.existsSync(dynamicCapturePath), 'Dynamic E2E capture must be written');
+
   const fixturePath = path.resolve(process.cwd(), 'test/fixtures/e2e-run.json');
-  fs.writeFileSync(fixturePath, JSON.stringify(fixtureData, null, 2), 'utf-8');
   assert.ok(fs.existsSync(fixturePath), 'Fixture test/fixtures/e2e-run.json must exist');
 
   // Clean up temporary repo

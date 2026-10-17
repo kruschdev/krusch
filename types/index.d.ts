@@ -492,3 +492,32 @@ export function closePool(): Promise<void>;
 export const pool: any;
 export function query(text: string, params?: any[], options?: { silent?: boolean }): Promise<any>;
 export function withTransaction<T = any>(callback: (client: any) => Promise<T>): Promise<T>;
+
+export function redactSecrets(text: string): string;
+export function routePipeline(prompt: string): Promise<{
+  stage: string;
+  tier: string;
+  role: string;
+  confidence: number;
+  recommendedProvider: string;
+  recommendedModel: string;
+  reason: string;
+  durationMs: number;
+}>;
+export function runDoctor(options?: { sibling?: string }): Promise<boolean>;
+export function startBridgeServer(options?: { port?: number; host?: string }): any;
+export function runHeadlessCi(
+  projectPath?: string,
+  options?: { patch?: string; goal?: string }
+): Promise<{ taskId: string; journalId: number; appliedCount: number }>;
+export function runVerifyModels(): Promise<{ sha256: string; length: number }>;
+export function runInvariantDemo(): Promise<{ ok: boolean }>;
+export function runBenchmark(options?: { iterations?: number }): Promise<{
+  iterations: number;
+  applySuccessRate: number;
+  applyMedianMs: number;
+  applyP95Ms: number;
+  driftRefusalRate: number;
+  driftMedianMs: number;
+  driftP95Ms: number;
+}>;

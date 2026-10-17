@@ -34,12 +34,13 @@ When you clone this repository, you get a fully functional, self-contained headl
 │  ✓ Operator Controls: CLI/MCP abort, retry, reject, explain status    │
 │  ✓ OpenTelemetry Spans & Cost Ledger: Audit trace JSON per task       │
 │  ✓ Real PR-Ready Patch Export: Myers unified diff for git apply       │
-│  ✓ Stdio MCP Server: 7-tool IDE bridge for KD Code or Claude Desktop   │
+│  ✓ Unified Control Plane: Doctor, :3778 HTTP Bridge & Headless CI     │
+│  ✓ Stdio MCP Server: 7-tool agent bridge with Invariant #567 hints    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 > [!NOTE]
-> **Decoupled Architecture**: Sibling packages (`krusch-pre-router`, `krusch-cascade-router`, `krusch-context-mcp`) are **purely optional adapters**. This repository includes its own in-tree regex heuristic gate and deterministic mock adapter that run out of the box with zero external git dependencies or cloud keys.
+> **Decoupled Architecture**: Sibling packages (`krusch-pre-router`, `krusch-cascade-router`, `krusch-context-mcp`, `krusch-git`) are **dynamically resolved adapters**. This repository includes its own in-tree regex heuristic gate and deterministic mock adapter that run out of the box with zero external git dependencies or cloud keys.
 
 ---
 
@@ -47,10 +48,10 @@ When you clone this repository, you get a fully functional, self-contained headl
 
 ```mermaid
 flowchart TD
-    subgraph ControlPlane ["Control Plane (Headless Engine)"]
-        CLI["CLI (bin/krusch.js)"]
-        MCP["MCP Server (stdio)"]
-        KDCode["KD Code / IDE"] --> MCP
+    subgraph ControlPlane ["Unified Headless Control Plane"]
+        CLI["CLI (bin/krusch.js: doctor / ci / verify-models)"]
+        Bridge["HTTP Control Bridge (127.0.0.1:3778)"]
+        MCP["MCP Server (stdio - 7 tools)"]
     end
 
     subgraph Workflow ["Workflow & Safety Engine"]

@@ -105,7 +105,7 @@ export class KruschVerificationContract {
     try {
       // Copy project files to sandbox (excluding .git, node_modules, temp files)
       KruschVerificationContract.copyTree(projectPath, sandboxDir, {
-        excludeDirs: ['.git', '.krusch', 'dist', 'build']
+        excludeDirs: ['.git', '.krusch', 'node_modules', 'dist', 'build']
       });
 
       // Overlay symlink for node_modules if present to avoid reinstall

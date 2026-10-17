@@ -21,6 +21,14 @@ import { query, pool, enableEphemeralMode } from '../src/brain/pool.js';
 import { HARNESS_PHASES } from '../src/workflow/fsm.js';
 import { generateUnifiedDiff } from '../src/utils/diff-patch.js';
 import { KruschTelemetry } from '../src/brain/telemetry.js';
+import {
+  runDoctor,
+  startBridgeServer,
+  runHeadlessCi,
+  runVerifyModels,
+  runInvariantDemo,
+  runBenchmark,
+} from '../src/control/control-plane.js';
 
 const program = new Command();
 
@@ -570,6 +578,89 @@ program
   .action(async () => {
     await migrate();
     process.exit(0);
+  });
+
+// 11. krusch doctor (alias: health)
+program
+  .command('doctor [sibling]')
+  .alias('health')
+  .description('Run unified 3-Tier ecosystem & PostgreSQL control-plane healthcheck')
+  .action(async (sibling) => {
+    const ok = await runDoctor({ sibling });
+    process.exit(ok ? 0 : 1);
+  });
+
+// 12. krusch serve (alias: up)
+program
+  .command('serve')
+  .alias('up')
+  .description('Start headless HTTP control-plane bridge daemon (default: 127.0.0.1:3778)')
+  .option('-p, --port <port>', 'Bridge HTTP port', '3778')
+  .option('-H, --host <host>', 'Bridge bind host', '127.0.0.1')
+  .action(async (options) => {
+    try {
+      await migrate();
+    } catch (_) {}
+    startBridgeServer({ port: parseInt(options.port, 10), host: options.host });
+  });
+
+// 13. krusch ci
+program
+  .command('ci [projectPath]')
+  .description('Execute headless CI staging, sandboxed verification, and 2PC atomic apply')
+  .option('--patch <file>', 'JSON patch manifest to stage and verify')
+  .option('--goal <goal>', 'Task goal description', 'Headless CI Automated Verification')
+  .action(async (projectPath, options) => {
+    try {
+      await runHeadlessCi(projectPath || process.cwd(), options);
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Headless CI Error: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 14. krusch verify-models
+program
+  .command('verify-models')
+  .description('Verify zero-context-loss prefix parity across Claude, Gemini, and Ollama')
+  .action(async () => {
+    try {
+      await runVerifyModels();
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Model Switch Verification Error: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 15. krusch demo-invariant
+program
+  .command('demo-invariant')
+  .description('Execute 7-step write invariant & working-tree drift refusal proof')
+  .action(async () => {
+    try {
+      await runInvariantDemo();
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Write Invariant Proof Error: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 16. krusch bench
+program
+  .command('bench')
+  .description('Run operational benchmarks for 2PC atomic apply and drift refusal')
+  .option('-i, --iterations <count>', 'Number of benchmark iterations', '15')
+  .action(async (options) => {
+    try {
+      await runBenchmark({ iterations: parseInt(options.iterations, 10) });
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Benchmark Error: ${err.message}\n`));
+      process.exit(1);
+    }
   });
 
 program.parse(process.argv);

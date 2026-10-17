@@ -32,12 +32,17 @@
 ## 🛠️ Key Commands
 
 - `npm test`: Run full test suite (unit + PostgreSQL integration).
-- `npm run test:unit`: Fast unit tests (router, normalizer, trajectory guard, modular-rsi, golden set).
+- `npm run test:unit`: Fast unit tests (router, normalizer, trajectory guard, modular-rsi, control-plane, golden set).
 - `npm run test:integration`: PostgreSQL lifecycle, two-phase apply transaction, crash recovery, and enforcement tests.
 - `npm run typecheck`: Verify TypeScript declarations (`tsc --noEmit`).
 - `npm run migrate`: Apply versioned migrations from `db/migrations/` to PostgreSQL.
 - `./bin/krusch.js init`: Bootstrap `.env`, probe PostgreSQL connectivity, and run migrations.
+- `./bin/krusch.js doctor [sibling]`: Unified 3-Tier ecosystem & PostgreSQL control-plane healthcheck.
+- `./bin/krusch.js serve [--port 3778]`: Start headless HTTP control-plane bridge daemon (`127.0.0.1:3778`).
 - `./bin/krusch.js run "<goal>" [--mock]`: Run CLI harness.
+- `./bin/krusch.js ci [projectPath] [--patch <file>]`: Headless CI staging, sandboxed verification, and 2PC apply.
+- `./bin/krusch.js verify-models`: Verify zero-context-loss SHA-256 prefix parity across Claude, Gemini, and Ollama.
+- `./bin/krusch.js demo-invariant`: Execute 7-step write invariant & working-tree drift refusal proof.
 - `./bin/krusch.js status <taskId> [--trace]`: Deep execution trace with invariant blocker diagnostics.
 - `./bin/krusch.js explain <taskId>`: Explain why transitions or actions are allowed or blocked.
 - `./bin/krusch.js diff <taskId> [--export <file>]`: Unified diff inspector and patch exporter.
@@ -49,22 +54,23 @@
 
 ## 📂 Architecture Map
 
-- `bin/krusch.js`: CLI binary entry point.
+- `bin/krusch.js`: Unified CLI binary entry point.
+- `src/control/`: Headless Control Plane (`control-plane.js`: Ecosystem Doctor, `:3778` HTTP Bridge, L1/L2 `routePipeline`, `redactSecrets`, Headless CI, Model-Switch Verifier, and 7-Step Write Invariant proof).
 - `src/brain/`: PostgreSQL state management, connection pooling, context retrieval (`krusch-context-mcp` bridge).
 - `src/router/`: Cascade router integrating `krusch-pre-router` and `krusch-cascade-router`.
 - `src/models/`: Normalized model adapters (OpenRouter, Anthropic, Gemini, Ollama, Mock).
 - `src/workflow/`: `KruschStateMachine`, `KruschTrajectoryGuard`, `KruschFailureClassifier` (`KruschModularRSI`).
 - `src/verify/`: Ground-truth test runner, verification contracts (`krusch.verify.json`), and staged-tree sandboxing.
 - `src/approvals/`: Human-in-the-loop and automated approval policies.
-- `src/server/`: Model Context Protocol (MCP) stdio server (thin 4-tool async interface).
+- `src/server/`: Model Context Protocol (MCP) stdio server (7-tool async interface with Invariant #567 annotations).
 
 ---
 
 ## 🚫 Non-Goals & "Do Not Implement" Guidelines
 
 To preserve harness reliability and eliminate architectural bloat:
-1. **Do NOT build IDE or GUI components**: Krusch is a headless execution engine. KD Code is the IDE control plane. Communication occurs exclusively via the thin 4-tool MCP server (`./bin/krusch.js mcp`) or CLI.
-2. **Do NOT add external routers or pin unpublished sibling repositories**: Routing is decoupled behind `src/router/interface.js`. The in-repo regex + mock gate runs out of the box with zero external git dependencies. External routers are optional pluggable adapters.
+1. **Do NOT build Electron or GUI shells**: Krusch is a pure headless control plane and ACID execution engine (the former `krusch-ide` / `t3code` GUI fork is retired in `projects/archive/krusch-ide`). Communication occurs exclusively via the 7-tool stdio MCP server (`./bin/krusch.js mcp`), the `:3778` HTTP bridge (`./bin/krusch.js serve`), or the CLI.
+2. **Do NOT hard-depend on external git repositories for offline execution**: Routing is decoupled behind `src/router/interface.js`. Sibling packages (`krusch-context-mcp`, `krusch-git`, `krusch-pre-router`, `krusch-cascade-router`) are dynamically resolved when present, while the in-repo regex + mock gate runs out of the box with zero external dependencies.
 3. **Do NOT bypass PostgreSQL staging**: Never write or mutate files on physical disk directly from tools or model adapters. All mutations must pass through `stage_diff -> VERIFY (staged tree) -> APPROVAL_GATE -> 2PC Apply Journal`.
 4. **Do NOT allow model shell execution during IMPLEMENT**: Shell commands (`run_command`) are strictly forbidden during `PLAN` and `IMPLEMENT` phases to prevent unverified out-of-band disk mutations.
 
