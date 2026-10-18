@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
   <a href="https://github.com/kruschdev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
-  <img src="https://img.shields.io/badge/tests-79%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-87%20passed-brightgreen.svg?style=flat-square" alt="Tests">
 </p>
 
 > **Core Thesis**: *Models are ephemeral compute; PostgreSQL is the brain. Keep workflow, context, tests, and approvals consistent while making models interchangeable.*
@@ -49,7 +49,7 @@ When you clone this repository, you get a fully functional, self-contained headl
 ```mermaid
 flowchart TD
     subgraph ControlPlane ["Unified Headless Control Plane"]
-        CLI["CLI (bin/krusch.js: doctor / ci / verify-models)"]
+        CLI["CLI (bin/krusch.js: doctor / ci / serve / bench)"]
         Bridge["HTTP Control Bridge (127.0.0.1:3778)"]
         MCP["MCP Server (stdio - 7 tools)"]
     end
@@ -165,9 +165,27 @@ The apply engine treats disk writes like database transactions:
 
 ## 🎛️ Operator CLI & FSM Controls
 
-Krusch provides operator commands to unstick and audit tasks:
+Krusch provides operator commands to unstick, audit, and manage tasks:
 
 ```bash
+# Check 3-Tier ecosystem health & dependencies
+krusch doctor
+
+# Start headless HTTP Control Bridge daemon (:3778)
+krusch serve
+
+# Run automated Headless CI gate
+krusch ci
+
+# Run 2PC Atomic Apply & Verification Latency Benchmark
+krusch bench
+
+# Prove 7-Step Write Invariant & Working-Tree Drift Refusal
+krusch demo-invariant
+
+# Verify byte-for-byte system prompt prefix parity across model wire formats
+krusch verify-models
+
 # Inspect task status, blocker explanations, and SQL invariant diagnostics
 krusch status <taskId>
 
@@ -197,7 +215,7 @@ krusch lease prune
 
 ## 🔌 Model Context Protocol (MCP) Interface
 
-Krusch runs as a headless stdio MCP server for IDEs (such as KD Code):
+Krusch runs as a headless stdio MCP server for coding agents and IDEs (Antigravity, Claude Code, Cursor, Windsurf):
 
 ```bash
 ./bin/krusch.js mcp
@@ -205,15 +223,15 @@ Krusch runs as a headless stdio MCP server for IDEs (such as KD Code):
 
 ### Frozen Tool Protocol
 
-| Tool Name | Phase Scope | Description |
-|---|---|---|
-| `krusch_run` | *Any* | Asynchronously initialize and run a task in PostgreSQL. |
-| `krusch_task_status` | *Any* | Poll task phase, verification runs, active diffs, and blockers. |
-| `krusch_explain` | *Any* | Explain next transition feasibility with SQL invariant tags. |
-| `krusch_diff` | *Any* | Retrieve unified diff of staged modifications. |
-| `krusch_reject` | `APPROVAL_GATE` | Reject a staged diff before application. |
-| `krusch_abort` | *Any non-terminal* | Abort a task and record the operator reason in `krusch_events`. |
-| `krusch_apply_diff` | `APPROVAL_GATE` | Commit verified staged diffs to disk via the 2PC journal. |
+| Tool Name | Phase Scope | Behavioral Invariant Annotations | Description |
+|---|---|---|---|
+| `krusch_run` | *Any* | `openWorldHint: true` | Asynchronously initialize and run a task in PostgreSQL. |
+| `krusch_task_status` | *Any* | `readOnlyHint: true, idempotentHint: true` | Poll task phase, verification runs, active diffs, and blockers. |
+| `krusch_explain` | *Any* | `readOnlyHint: true, idempotentHint: true` | Explain next transition feasibility with SQL invariant tags. |
+| `krusch_diff` | *Any* | `readOnlyHint: true, idempotentHint: true` | Retrieve unified diff of staged modifications. |
+| `krusch_reject` | `APPROVAL_GATE` | `destructiveHint: true` | Reject a staged diff before application. |
+| `krusch_abort` | *Any non-terminal* | `destructiveHint: true` | Abort a task and record the operator reason in `krusch_events`. |
+| `krusch_apply_diff` | `APPROVAL_GATE` | `destructiveHint: true` | Commit verified staged diffs to disk via the 2PC journal. |
 
 ---
 
@@ -222,13 +240,13 @@ Krusch runs as a headless stdio MCP server for IDEs (such as KD Code):
 The test suite exercises unit behavior, storage engine properties, sandbox isolation, and PostgreSQL integration:
 
 ```bash
-# Run fast unit tests (AST indexer, router heuristics, sandbox allowlist, RSI)
+# Run fast unit tests (AST indexer, router heuristics, sandbox allowlist, RSI, control plane)
 npm run test:unit
 
 # Run storage engine property & PostgreSQL integration tests
 npm run test:integration
 
-# Run full test suite (79 tests across unit, integration, and ephemeral)
+# Run full test suite (87 tests across unit, integration, and ephemeral)
 npm test
 
 # Verify TypeScript declarations (zero errors)
@@ -243,7 +261,7 @@ npm pack --dry-run
 ## 🚫 Non-Goals
 
 To preserve reliability and prevent architectural bloat:
-1. **No IDE or GUI components**: Krusch is a headless execution engine. KD Code or Claude Desktop serves as the UI control plane.
+1. **No IDE or GUI components**: Krusch is a pure headless execution engine and control plane. Antigravity, Claude Code, Cursor, or the `:3778` HTTP Bridge serves as the interaction surface.
 2. **No required external routers**: Routing is decoupled behind `src/router/interface.js`. The in-tree heuristic gate runs with zero external dependencies.
 3. **No direct disk mutations**: All mutations must proceed through `stage_diff -> sandboxed VERIFY -> APPROVAL_GATE -> 2PC apply`.
 4. **No shell execution in IMPLEMENT**: Freeform shell commands (`run_command`) are strictly forbidden during `PLAN` and `IMPLEMENT` phases.
