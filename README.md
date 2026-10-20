@@ -10,6 +10,7 @@
   <a href="https://github.com/kruschdev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
   <img src="https://img.shields.io/badge/tests-87%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <a href="https://hol.org/guard/extension-studio?extension=mcp.krusch"><img src="https://img.shields.io/badge/HOL_Guard-Catalog_Listed-0B0F17?style=flat-square&logo=shield&logoColor=00F5D4" alt="HOL Guard Catalog"></a>
 </p>
 
 > **Core Thesis**: *Models are ephemeral compute; PostgreSQL is the brain. Keep workflow, context, tests, and approvals consistent while making models interchangeable.*
