@@ -4,6 +4,12 @@ import crypto from 'crypto';
  * Pricing rates per 1,000,000 tokens for cost estimation
  */
 const MODEL_PRICING = {
+  'gemini-4-argon': { prompt: 1.80, completion: 10.80, cachedPrompt: 0.09 },
+  'google/gemini-4-argon': { prompt: 1.80, completion: 10.80, cachedPrompt: 0.09 },
+  'gemini-3.1-flash-lite': { prompt: 0.25, completion: 1.50 },
+  'google/gemini-3.1-flash-lite': { prompt: 0.25, completion: 1.50 },
+  'gemini-3-flash-preview': { prompt: 0.30, completion: 1.20 },
+  'google/gemini-3-flash-preview': { prompt: 0.30, completion: 1.20 },
   'google/gemini-2.5-flash': { prompt: 0.075, completion: 0.30 },
   'anthropic/claude-3-5-sonnet': { prompt: 3.00, completion: 15.00 },
   'anthropic/claude-3-7-sonnet': { prompt: 3.00, completion: 15.00 },
@@ -15,11 +21,15 @@ const MODEL_PRICING = {
 
 export class KruschTelemetry {
   /**
-   * Calculate cost estimate in USD based on model pricing table.
+   * Calculate cost estimate in USD based on model pricing table (including 95% implicit cache discount for Gemini 4 Argon).
    */
-  static calculateTokenCost(modelId, promptTokens = 0, completionTokens = 0) {
+  static calculateTokenCost(modelId, promptTokens = 0, completionTokens = 0, cachedPromptTokens = 0) {
     const rate = MODEL_PRICING[modelId] || MODEL_PRICING['google/gemini-2.5-flash'];
-    const promptCost = (promptTokens / 1_000_000) * rate.prompt;
+    const safeCached = Math.max(0, Math.min(promptTokens, cachedPromptTokens || 0));
+    const uncachedPrompt = Math.max(0, promptTokens - safeCached);
+    const cachedRate = rate.cachedPrompt !== undefined ? rate.cachedPrompt : rate.prompt * 0.1;
+    const promptCost =
+      (uncachedPrompt / 1_000_000) * rate.prompt + (safeCached / 1_000_000) * cachedRate;
     const completionCost = (completionTokens / 1_000_000) * rate.completion;
     return Number((promptCost + completionCost).toFixed(6));
   }
@@ -64,7 +74,8 @@ export class KruschTelemetry {
         const turnSpanId = crypto.randomBytes(8).toString('hex');
         const promptTokens = turn.token_usage?.prompt_tokens || turn.token_usage?.input_tokens || 0;
         const completionTokens = turn.token_usage?.completion_tokens || turn.token_usage?.output_tokens || 0;
-        const turnCost = KruschTelemetry.calculateTokenCost(turn.model_id, promptTokens, completionTokens);
+        const cachedTokens = turn.token_usage?.cached_tokens || turn.token_usage?.cachedContentTokenCount || 0;
+        const turnCost = KruschTelemetry.calculateTokenCost(turn.model_id, promptTokens, completionTokens, cachedTokens);
 
         totalPromptTokens += promptTokens;
         totalCompletionTokens += completionTokens;

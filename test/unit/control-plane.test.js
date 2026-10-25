@@ -92,3 +92,98 @@ test('Invariant #567: All 7 MCP tools declare readOnlyHint, destructiveHint, ide
     assert.equal(typeof tool.annotations.openWorldHint, 'boolean', `${tool.name}.openWorldHint`);
   }
 });
+
+test('ARCH-01 & ARCH-02: MCP server encapsulates activeTasks with bounded capacity and enforces close() timeout', async () => {
+  const mcpServer = createMcpServer({ shutdownTimeoutMs: 30, maxActiveTasks: 2 });
+  assert.equal(mcpServer.activeTasks, undefined, 'activeTasks Map must remain private to createMcpServer closure');
+  assert.equal(typeof mcpServer.registerTask, 'function');
+  assert.equal(typeof mcpServer.listTasks, 'function');
+
+  mcpServer.registerTask('stalled-1', new Promise(() => {}));
+  mcpServer.registerTask('stalled-2', new Promise(() => {}));
+  assert.deepEqual(mcpServer.listTasks(), ['stalled-1', 'stalled-2']);
+
+  assert.throws(
+    () => mcpServer.registerTask('overflow-3', new Promise(() => {})),
+    /Maximum active task limit reached/
+  );
+
+  const start = Date.now();
+  await mcpServer.close();
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 1000, `Expected bounded shutdown within 1000ms, took ${elapsed}ms`);
+});
+
+test('BUG-01: registerTask rejects duplicate taskKey below limit and enforces maxActiveTasks unconditionally', () => {
+  const mcpServer = createMcpServer({ maxActiveTasks: 2 });
+
+  mcpServer.registerTask('task-1', new Promise(() => {}));
+
+  // Registering a duplicate taskKey below maxActiveTasks limit throws Duplicate active task ID
+  assert.throws(
+    () => mcpServer.registerTask('task-1', new Promise(() => {})),
+    /Duplicate active task ID: task-1/
+  );
+
+  mcpServer.registerTask('task-2', new Promise(() => {}));
+
+  // Registering a duplicate taskKey when activeTasks.size >= maxActiveTasks throws Maximum active task limit reached
+  assert.throws(
+    () => mcpServer.registerTask('task-1', new Promise(() => {})),
+    /Maximum active task limit reached \(2\)/
+  );
+});
+
+test('Control Plane: Software Factory Control Room UI (GET / and /factory) and portable AST Blast Radius (GET /api/ast/graph)', async () => {
+  const server = startBridgeServer({ port: 0, host: '127.0.0.1' });
+  await new Promise((resolve) => server.once('listening', resolve));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const uiRes = await fetch(`${baseUrl}/`);
+    assert.equal(uiRes.status, 200);
+    assert.ok((uiRes.headers.get('content-type') || '').includes('text/html'));
+    const html = await uiRes.text();
+    assert.ok(html.includes('Krusch Software Factory'), 'Should render Software Factory Control Room HTML');
+    assert.ok(html.includes('STATION 01'), 'Should render STATION 01');
+    assert.ok(html.includes('STATION 04'), 'Should render STATION 04');
+
+    const astRes = await fetch(`${baseUrl}/api/ast/graph?symbol=startBridgeServer`);
+    assert.equal(astRes.status, 200);
+    const astData = await astRes.json();
+    assert.equal(astData.ok, true);
+    assert.ok(astData.filesScanned > 0, 'Should scan local files without requiring external database');
+    assert.ok(Array.isArray(astData.matchingSymbols) && astData.matchingSymbols.length > 0);
+    assert.ok(Array.isArray(astData.inboundCallers) && astData.inboundCallers.length > 0);
+    assert.ok(Array.isArray(astData.outboundCallees));
+  } finally {
+    server.close();
+  }
+});
+
+test('BUG-01 & SEC-01: validates KRUSCH_DEBUG boolean flags and rejects task registration during MCP server close', async () => {
+  const { isKruschDebugEnabled } = await import('../../src/brain/context-client.js');
+  const { createMcpServer } = await import('../../src/server/mcp-server.js');
+
+  assert.equal(isKruschDebugEnabled({}), false);
+  assert.equal(isKruschDebugEnabled({ KRUSCH_DEBUG: 'false' }), false);
+  assert.equal(isKruschDebugEnabled({ KRUSCH_DEBUG: '0' }), false);
+  assert.equal(isKruschDebugEnabled({ KRUSCH_DEBUG: 'true' }), true);
+  assert.equal(isKruschDebugEnabled({ KRUSCH_DEBUG: '1' }), true);
+
+  const mcp = createMcpServer({ shutdownTimeoutMs: 500 });
+  let resolveTask;
+  const pending = new Promise((r) => { resolveTask = r; });
+  mcp.registerTask('task-before-close', pending);
+  assert.deepEqual(mcp.listTasks(), ['task-before-close']);
+
+  const closePromise = mcp.close();
+  assert.throws(
+    () => mcp.registerTask('task-during-close', Promise.resolve()),
+    /Cannot register task: MCP server is shutting down/
+  );
+  resolveTask('ok');
+  await closePromise;
+  assert.deepEqual(mcp.listTasks(), []);
+});

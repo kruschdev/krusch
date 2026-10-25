@@ -62,7 +62,11 @@ export class KruschFSM {
         cachedDbTransitions = graph;
         return cachedDbTransitions;
       }
-    } catch (_) {}
+    } catch (err) {
+      if (process.env.KRUSCH_DEBUG) {
+        console.warn('[KruschFSM] Falling back to static ALLOWED_TRANSITIONS:', err.message);
+      }
+    }
     return ALLOWED_TRANSITIONS;
   }
 

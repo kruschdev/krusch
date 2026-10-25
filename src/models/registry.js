@@ -1,5 +1,6 @@
 import { OpenRouterAdapter } from './providers/openrouter.js';
 import { OllamaAdapter } from './providers/ollama.js';
+import { GeminiAdapter } from './providers/gemini.js';
 import { MockModelAdapter } from './providers/mock.js';
 
 export class ModelRegistry {
@@ -9,7 +10,7 @@ export class ModelRegistry {
     this.mockAdapter = options.mockAdapter || new MockModelAdapter({ simulateTrajectory: options.simulateMockTrajectory });
   }
 
-  getAdapter(modelId) {
+  getAdapter(modelId = '') {
     if (this.options.useMock || modelId.startsWith('mock/')) {
       return this.mockAdapter;
     }
@@ -19,6 +20,17 @@ export class ModelRegistry {
         this.adapters.set('ollama', new OllamaAdapter(this.options.ollama));
       }
       return this.adapters.get('ollama');
+    }
+
+    if (
+      modelId.startsWith('gemini/') ||
+      modelId.startsWith('gemini-') ||
+      (modelId.startsWith('google/gemini-') && (this.options.gemini || process.env.GEMINI_API_KEY))
+    ) {
+      if (!this.adapters.has('gemini')) {
+        this.adapters.set('gemini', new GeminiAdapter(this.options.gemini));
+      }
+      return this.adapters.get('gemini');
     }
 
     // Default to OpenRouter for domain specialists and frontier models

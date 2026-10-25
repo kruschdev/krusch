@@ -19,23 +19,90 @@ import { query, pool } from '../brain/pool.js';
  * Factory function creating and configuring the Krusch MCP Server instance.
  * Allows in-memory testing without spawning stdio child processes.
  */
-export function createMcpServer() {
+export function createMcpServer(options = {}) {
+  const shutdownTimeoutMs = Number(options.shutdownTimeoutMs ?? 30_000);
+  const maxActiveTasks = Math.max(1, Number(options.maxActiveTasks ?? 10_000));
   const server = new Server(
     { name: 'krusch-harness', version: '0.1.0' },
     { capabilities: { tools: {} } }
   );
 
   const activeTasks = new Map();
-  server.activeTasks = activeTasks;
+  let isClosing = false;
+  let closingPromise = null;
+
+  server.registerTask = (id, taskPromise) => {
+    const taskKey = String(id || '').trim();
+    if (!taskKey) {
+      throw new McpError(ErrorCode.InvalidParams, 'Task ID must be a non-empty string');
+    }
+    if (isClosing) {
+      throw new McpError(ErrorCode.InternalError, 'Cannot register task: MCP server is shutting down');
+    }
+    if (activeTasks.size >= maxActiveTasks) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Maximum active task limit reached (${maxActiveTasks})`
+      );
+    }
+    if (activeTasks.has(taskKey)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Duplicate active task ID: ${taskKey}`
+      );
+    }
+    const tracked = Promise.resolve(taskPromise);
+    if (isClosing) {
+      throw new McpError(ErrorCode.InternalError, 'Cannot register task: MCP server is shutting down');
+    }
+    activeTasks.set(taskKey, tracked);
+    tracked.finally(() => {
+      if (activeTasks.get(taskKey) === tracked) {
+        activeTasks.delete(taskKey);
+      }
+    });
+    return tracked;
+  };
+
+  server.listTasks = () => Array.from(activeTasks.keys());
 
   const originalClose = server.close.bind(server);
   server.close = async () => {
-    if (activeTasks.size > 0) {
-      await Promise.allSettled(Array.from(activeTasks.values()));
+    if (closingPromise) {
+      return closingPromise;
     }
-    return originalClose();
+    isClosing = true;
+    closingPromise = (async () => {
+      if (activeTasks.size > 0) {
+        let timer = null;
+        const drainSequentially = async () => {
+          while (activeTasks.size > 0) {
+            const snapshot = Array.from(activeTasks.values());
+            await Promise.allSettled(snapshot);
+          }
+        };
+        try {
+          await Promise.race([
+            drainSequentially(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error('MCP shutdown timeout')), shutdownTimeoutMs);
+            })
+          ]);
+        } catch (err) {
+          console.warn(
+            `MCP shutdown timed out after ${Math.round(shutdownTimeoutMs / 1000)} s – forcing termination of remaining tasks`
+          );
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+      return originalClose();
+    })();
+    return closingPromise;
   };
 
+
+  // Invariant #567: All 7 MCP tools must declare readOnlyHint, destructiveHint, idempotentHint, and openWorldHint
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
@@ -233,10 +300,8 @@ export function createMcpServer() {
           console.error(`[krusch:mcp] Background execution error for ${taskId}: ${err.message}`);
         });
 
-        activeTasks.set(taskId, taskPromise);
-        taskPromise.finally(() => {
-          activeTasks.delete(taskId);
-        });
+        server.registerTask(taskId, taskPromise);
+
 
         return {
           content: [{

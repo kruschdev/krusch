@@ -594,11 +594,15 @@ program
 program
   .command('serve')
   .alias('up')
-  .description('Start headless HTTP control-plane bridge daemon (default: 127.0.0.1:3778)')
+  .description('Start HTTP Software Factory Control Room & control-plane bridge daemon (default: 127.0.0.1:3778)')
   .option('-p, --port <port>', 'Bridge HTTP port', '3778')
   .option('-H, --host <host>', 'Bridge bind host', '127.0.0.1')
+  .option('--ephemeral', 'Run with throwaway in-process PostgreSQL database (zero external setup)', false)
   .action(async (options) => {
     try {
+      if (options.ephemeral) {
+        enableEphemeralMode();
+      }
       await migrate();
     } catch (_) {}
     startBridgeServer({ port: parseInt(options.port, 10), host: options.host });

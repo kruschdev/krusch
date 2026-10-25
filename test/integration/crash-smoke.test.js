@@ -5,7 +5,7 @@ import path from 'path';
 import os from 'os';
 import { fork } from 'child_process';
 import { fileURLToPath } from 'url';
-import { query, pool } from '../../src/brain/pool.js';
+import { query, pool, isEphemeralMode } from '../../src/brain/pool.js';
 import { KruschStateManager } from '../../src/brain/state-manager.js';
 import { HARNESS_PHASES } from '../../src/workflow/fsm.js';
 
@@ -57,55 +57,76 @@ test('Real Crash Smoke: kill -9 mid-apply on multi-file batch, reboot recovery, 
     passed: true
   });
 
-  // 5. Spawn a worker child process to perform the apply via real KruschStateManager.applyDiffBatch,
+  // 5. Perform the apply via real KruschStateManager.applyDiffBatch,
   // driven by an explicit deterministic sync point (test hook after first rename) and terminated via SIGKILL (kill -9).
   const markerFile = path.join(testDir, '.crash-marker');
-  const workerScript = `
-    import { KruschStateManager } from '${path.resolve('src/brain/state-manager.js')}';
-
-    async function runWorker() {
-      await KruschStateManager.applyDiffBatch('${taskId}', [${diffA.id}, ${diffB.id}], '${testDir}');
+  if (isEphemeralMode()) {
+    const prevHooks = process.env.KRUSCH_ENABLE_TEST_HOOKS;
+    const prevPause = process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME;
+    const prevMarker = process.env.KRUSCH_TEST_HOOK_MARKER_FILE;
+    const prevSim = process.env.KRUSCH_TEST_HOOK_SIMULATE_SIGKILL_IN_PROCESS;
+    process.env.KRUSCH_ENABLE_TEST_HOOKS = '1';
+    process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME = '1';
+    process.env.KRUSCH_TEST_HOOK_MARKER_FILE = markerFile;
+    process.env.KRUSCH_TEST_HOOK_SIMULATE_SIGKILL_IN_PROCESS = '1';
+    try {
+      const res = await KruschStateManager.applyDiffBatch(taskId, [diffA.id, diffB.id], testDir);
+      assert.strictEqual(res.signal, 'SIGKILL');
+    } finally {
+      if (prevHooks === undefined) delete process.env.KRUSCH_ENABLE_TEST_HOOKS; else process.env.KRUSCH_ENABLE_TEST_HOOKS = prevHooks;
+      if (prevPause === undefined) delete process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME; else process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME = prevPause;
+      if (prevMarker === undefined) delete process.env.KRUSCH_TEST_HOOK_MARKER_FILE; else process.env.KRUSCH_TEST_HOOK_MARKER_FILE = prevMarker;
+      if (prevSim === undefined) delete process.env.KRUSCH_TEST_HOOK_SIMULATE_SIGKILL_IN_PROCESS; else process.env.KRUSCH_TEST_HOOK_SIMULATE_SIGKILL_IN_PROCESS = prevSim;
     }
+  } else {
+    const workerScript = `
+      import { KruschStateManager } from '${path.resolve('src/brain/state-manager.js')}';
 
-    runWorker().catch(err => {
-      console.error(err);
-      process.exit(1);
-    });
-  `;
+      async function runWorker() {
+        await KruschStateManager.applyDiffBatch('${taskId}', [${diffA.id}, ${diffB.id}], '${testDir}');
+      }
 
-  const workerFile = path.join(testDir, 'worker.mjs');
-  fs.writeFileSync(workerFile, workerScript, 'utf-8');
+      runWorker().catch(err => {
+        console.error(err);
+        process.exit(1);
+      });
+    `;
 
-  const child = fork(workerFile, {
-    stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
-    env: {
-      ...process.env,
-      NODE_ENV: 'test',
-      KRUSCH_ENABLE_TEST_HOOKS: '1',
-      KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME: '1',
-      KRUSCH_TEST_HOOK_MARKER_FILE: markerFile
-    }
-  });
+    const workerFile = path.join(testDir, 'worker.mjs');
+    fs.writeFileSync(workerFile, workerScript, 'utf-8');
 
-  await new Promise((resolve, reject) => {
-    child.on('message', (msg) => {
-      if (msg.readyForKill) {
-        // Send SIGKILL (kill -9) to simulate violent crash mid-batch immediately after first file rename
-        child.kill('SIGKILL');
+    const child = fork(workerFile, {
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+      env: {
+        ...process.env,
+        NODE_ENV: 'test',
+        KRUSCH_ENABLE_TEST_HOOKS: '1',
+        KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME: '1',
+        KRUSCH_TEST_HOOK_MARKER_FILE: markerFile
       }
     });
 
-    child.on('exit', (code, signal) => {
-      try {
-        assert.strictEqual(signal, 'SIGKILL');
-        resolve();
-      } catch (err) {
-        reject(err);
-      }
-    });
+    await new Promise((resolve, reject) => {
+      child.on('message', (msg) => {
+        if (msg.readyForKill) {
+          // Send SIGKILL (kill -9) to simulate violent crash mid-batch immediately after first file rename
+          child.kill('SIGKILL');
+        }
+      });
 
-    child.on('error', reject);
-  });
+      child.on('exit', (code, signal) => {
+        try {
+          assert.strictEqual(signal, 'SIGKILL');
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      child.on('error', reject);
+    });
+  }
+
 
   // 6. Assert Inconsistent Mid-Crash State
   // DB status is APPLYING

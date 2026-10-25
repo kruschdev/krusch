@@ -93,6 +93,69 @@ export class KruschToolNormalizer {
   }
 
   /**
+   * Convert standard tool definitions to Google Gemini functionDeclarations format.
+   */
+  static toGeminiSchema(tools) {
+    if (!Array.isArray(tools) || tools.length === 0) return [];
+    return [
+      {
+        functionDeclarations: tools.map(t => ({
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters || { type: 'object', properties: {} }
+        }))
+      }
+    ];
+  }
+
+  /**
+   * Extract uniform tool calls, text, thoughts, and usage (including thoughtsTokenCount
+   * and cachedContentTokenCount for Gemini 4 Argon) from a Gemini generateContent response.
+   */
+  static parseGeminiResponse(data) {
+    const candidate = data?.candidates?.[0] || {};
+    const parts = candidate?.content?.parts || [];
+    let text = '';
+    let thought = '';
+    const toolCalls = [];
+
+    parts.forEach((part, idx) => {
+      if (part.thought && typeof part.text === 'string') {
+        thought += part.text;
+      } else if (typeof part.text === 'string') {
+        text += part.text;
+      } else if (part.functionCall) {
+        toolCalls.push({
+          id: `gemini_call_${idx}_${Date.now()}`,
+          name: part.functionCall.name,
+          args: part.functionCall.args || {}
+        });
+      }
+    });
+
+    const meta = data?.usageMetadata || {};
+    const promptTokens = meta.promptTokenCount || 0;
+    const candidatesTokens = meta.candidatesTokenCount || 0;
+    const thoughtsTokens = meta.thoughtsTokenCount || 0;
+    const cachedTokens = meta.cachedContentTokenCount || 0;
+
+    return {
+      text,
+      thought,
+      toolCalls,
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: candidatesTokens + thoughtsTokens,
+        candidates_tokens: candidatesTokens,
+        thoughts_tokens: thoughtsTokens,
+        cached_tokens: cachedTokens,
+        total_tokens: meta.totalTokenCount || promptTokens + candidatesTokens + thoughtsTokens
+      },
+      finishReason: candidate?.finishReason || 'STOP'
+    };
+  }
+
+  /**
    * Extract uniform tool calls from Ollama chat response.
    */
   static parseOllamaResponse(data) {

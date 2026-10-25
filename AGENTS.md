@@ -17,8 +17,8 @@
    - Files are written to physical disk only after automated test verification passes and approval policy criteria are satisfied.
 
 3. **Routing Discipline ("Don't spend a model call just to pick a model")**:
-   - Stage 1 (L1) microsecond CPU heuristic gate intercepts obvious SQL, syntax, math, and closed-world tasks for $0.00 in <15µs (`krusch-pre-router`).
-   - Escalate to frontier reasoning (`claude-3-7-sonnet`, `deepseek-r1`) only on ambiguous intent, high complexity, or repeated verification failures.
+   - Stage 1 (L1) microsecond CPU heuristic gate intercepts obvious SQL, syntax, math, and closed-world tasks for $0.00 in <15µs (`krusch-pre-router`), routing local execution to `qwen2.5-coder:7b` (`krusch`), `gemma4:e4b` / `hermes3:latest` (`kruschserv`), or `qwen3-coder-30b-moe:latest` (`kruschdev`).
+   - Escalate to frontier reasoning (`gemini-4-argon` with `thinkingLevel: 'high'` & multi-hop `CONTINUATION`, `claude-3-7-sonnet`) only on ambiguous intent, high complexity, or repeated verification failures.
 
 4. **Actionable Failure Attribution**:
    - Failures must be attributed to specific modules (`ContextManagement`, `ToolUse`, `ObservationManagement`, `AgentLoop`) using `KruschFailureClassifier` (`KruschModularRSI`) rather than blind re-prompting.

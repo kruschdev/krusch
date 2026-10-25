@@ -16,6 +16,7 @@ export class KruschSymbolIndexer {
     const targetFiles = options.files || KruschSymbolIndexer.discoverSourceFiles(projectPath, maxFiles);
 
     let indexedCount = 0;
+    let failedCount = 0;
     for (const filePath of targetFiles) {
       const fullPath = path.isAbsolute(filePath) ? filePath : path.join(projectPath, filePath);
       const relPath = path.relative(projectPath, fullPath).replace(/\\/g, '/');
@@ -43,11 +44,16 @@ export class KruschSymbolIndexer {
             ]
           );
           indexedCount++;
-        } catch (_) {}
+        } catch (err) {
+          failedCount++;
+          if (process.env.KRUSCH_DEBUG) {
+            console.warn(`[KruschSymbolIndexer] Failed indexing symbol ${sym.symbol_name}:`, err.message);
+          }
+        }
       }
     }
 
-    return { filesScanned: targetFiles.length, symbolsIndexed: indexedCount };
+    return { filesScanned: targetFiles.length, symbolsIndexed: indexedCount, failedCount };
   }
 
   /**
@@ -77,7 +83,11 @@ export class KruschSymbolIndexer {
             ]
           );
           snapshotCount++;
-        } catch (_) {}
+        } catch (err) {
+          if (process.env.KRUSCH_DEBUG) {
+            console.warn(`[KruschSymbolIndexer] Failed snapshotting symbol ${sym.symbol_name}:`, err.message);
+          }
+        }
       }
     }
 
@@ -95,7 +105,10 @@ export class KruschSymbolIndexer {
       let entries = [];
       try {
         entries = fs.readdirSync(currentDir, { withFileTypes: true });
-      } catch (_) {
+      } catch (err) {
+        if (process.env.KRUSCH_DEBUG) {
+          console.warn(`[KruschSymbolIndexer] Cannot read directory ${currentDir}:`, err.message);
+        }
         return;
       }
 
@@ -132,7 +145,10 @@ export class KruschSymbolIndexer {
     let content = '';
     try {
       content = fs.readFileSync(filePath, 'utf-8');
-    } catch (_) {
+    } catch (err) {
+      if (process.env.KRUSCH_DEBUG) {
+        console.warn(`[KruschSymbolIndexer] Cannot read file ${filePath}:`, err.message);
+      }
       return symbols;
     }
 
@@ -384,4 +400,136 @@ export class KruschSymbolIndexer {
       }
     }
   }
+
+  /**
+   * Portable zero-DB AST & Blast-Radius Analyzer for any local repository path.
+   * Extracts all symbols across JS/TS/Py/Go/Rust and computes inbound callers and outbound callees
+   * for a target symbol in <25ms without requiring an external PostgreSQL server.
+   */
+  static analyzeBlastRadius(projectPath, symbolQuery = '', options = {}) {
+    const t0 = performance.now();
+    const resolvedRoot = path.resolve(projectPath || process.cwd());
+    const maxFiles = options.maxFiles || 150;
+    const files = KruschSymbolIndexer.discoverSourceFiles(resolvedRoot, maxFiles);
+
+    const allSymbols = [];
+    const fileLinesMap = new Map();
+
+    for (const fullPath of files) {
+      const relPath = path.relative(resolvedRoot, fullPath).replace(/\\/g, '/');
+      let content = '';
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch (_) {
+        continue;
+      }
+      fileLinesMap.set(relPath, content.split('\n'));
+      const extracted = KruschSymbolIndexer.extractSymbolsFromFile(fullPath, relPath, resolvedRoot);
+      for (const s of extracted) {
+        allSymbols.push(s);
+      }
+    }
+
+    const q = String(symbolQuery || '').trim();
+    const matchingSymbols = q
+      ? allSymbols.filter(
+          (s) =>
+            s.symbol_name.toLowerCase().includes(q.toLowerCase()) ||
+            (s.signature && s.signature.toLowerCase().includes(q.toLowerCase())),
+        )
+      : allSymbols.slice(0, 25);
+
+    const exactMatch =
+      allSymbols.find((s) => s.symbol_name === q) ||
+      matchingSymbols[0] ||
+      allSymbols[0] ||
+      null;
+
+    const inboundCallers = [];
+    const outboundCallees = [];
+
+    if (exactMatch) {
+      const targetName = exactMatch.symbol_name;
+      const escaped = targetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const callRegex = new RegExp(`\\b${escaped}\\b`);
+
+      for (const [relPath, lines] of fileLinesMap.entries()) {
+        const fileSyms = allSymbols.filter((s) => s.file_path === relPath);
+        for (let idx = 0; idx < lines.length; idx++) {
+          const lineNum = idx + 1;
+          const rawLine = lines[idx];
+          const trimmed = rawLine.trim();
+          if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.startsWith('#')) {
+            continue;
+          }
+          if (relPath === exactMatch.file_path && lineNum === exactMatch.start_line) {
+            continue;
+          }
+          if (callRegex.test(trimmed)) {
+            let enclosingSymbol = 'module_scope';
+            for (const fsym of fileSyms) {
+              if (fsym.start_line <= lineNum) {
+                enclosingSymbol = fsym.symbol_name;
+              }
+            }
+            inboundCallers.push({
+              file_path: relPath,
+              line: lineNum,
+              caller_symbol: enclosingSymbol,
+              is_import: /^(?:import|from|const\s+.*=\s*require)/.test(trimmed),
+              snippet: trimmed.slice(0, 140),
+            });
+            if (inboundCallers.length >= 40) break;
+          }
+        }
+        if (inboundCallers.length >= 40) break;
+      }
+
+      // Compute outbound callees within the target symbol's file window
+      const targetLines = fileLinesMap.get(exactMatch.file_path) || [];
+      const sameFileSyms = allSymbols
+        .filter((s) => s.file_path === exactMatch.file_path)
+        .sort((a, b) => a.start_line - b.start_line);
+      const symIdx = sameFileSyms.findIndex(
+        (s) => s.symbol_name === exactMatch.symbol_name && s.start_line === exactMatch.start_line,
+      );
+      const nextSymLine =
+        symIdx >= 0 && symIdx + 1 < sameFileSyms.length
+          ? sameFileSyms[symIdx + 1].start_line - 1
+          : Math.min(targetLines.length, exactMatch.start_line + 80);
+
+      const bodySlice = targetLines.slice(exactMatch.start_line, nextSymLine).join('\n');
+      const seenCallees = new Set();
+      for (const candidate of allSymbols) {
+        if (candidate.symbol_name === exactMatch.symbol_name || candidate.symbol_name.length < 3) continue;
+        if (seenCallees.has(candidate.symbol_name)) continue;
+        const candEsc = candidate.symbol_name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`\\b${candEsc}\\s*\\(`).test(bodySlice)) {
+          seenCallees.add(candidate.symbol_name);
+          outboundCallees.push({
+            symbol_name: candidate.symbol_name,
+            symbol_type: candidate.symbol_type,
+            file_path: candidate.file_path,
+            line: candidate.start_line,
+            signature: candidate.signature,
+          });
+          if (outboundCallees.length >= 25) break;
+        }
+      }
+    }
+
+    const durationMs = Number((performance.now() - t0).toFixed(2));
+    return {
+      ok: true,
+      projectPath: resolvedRoot,
+      filesScanned: files.length,
+      totalSymbols: allSymbols.length,
+      durationMs,
+      targetSymbol: exactMatch,
+      matchingSymbols: matchingSymbols.slice(0, 25),
+      inboundCallers,
+      outboundCallees,
+    };
+  }
 }
+

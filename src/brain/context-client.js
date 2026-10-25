@@ -3,6 +3,14 @@ import path from 'path';
 import { query } from './pool.js';
 import { KruschSymbolIndexer } from './indexer.js';
 
+const TRUTHY_DEBUG_VALUES = new Set(['1', 'true', 'yes', 'on', 'debug']);
+
+export function isKruschDebugEnabled(env = process.env) {
+  const raw = env?.KRUSCH_DEBUG;
+  if (typeof raw !== 'string') return false;
+  return TRUTHY_DEBUG_VALUES.has(raw.trim().toLowerCase());
+}
+
 export class KruschContextClient {
   /**
    * Assemble grounded context for a prompt or file scope.
@@ -11,7 +19,11 @@ export class KruschContextClient {
     if (options.indexSymbols !== false) {
       try {
         await KruschSymbolIndexer.indexProject(projectPath, { maxFiles: 30 });
-      } catch (_) {}
+      } catch (err) {
+        if (isKruschDebugEnabled()) {
+          console.warn('[KruschContextClient] Optional symbol indexing skipped:', err.message);
+        }
+      }
     }
 
     const symbolMatches = await this.searchCodeSymbols(queryText, options.limit || 10);
@@ -46,7 +58,11 @@ export class KruschContextClient {
         { silent: true }
       );
       stagedFiles = (stagedRows.rows || []).map(r => r.file_path);
-    } catch (_) {}
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Staged files query failed:', err.message);
+      }
+    }
 
     // Get failing test locations
     const errorFiles = [];
@@ -66,7 +82,11 @@ export class KruschContextClient {
           }
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Verification errors query failed:', err.message);
+      }
+    }
 
     const scopedFiles = Array.from(new Set([...stagedFiles, ...errorFiles]));
 
@@ -74,7 +94,11 @@ export class KruschContextClient {
     if (scopedFiles.length > 0) {
       try {
         await KruschSymbolIndexer.snapshotTaskSymbols(taskId, projectPath, scopedFiles);
-      } catch (_) {}
+      } catch (err) {
+        if (isKruschDebugEnabled()) {
+          console.warn('[KruschContextClient] Task symbol snapshot failed:', err.message);
+        }
+      }
     }
 
     // Query task symbols first
@@ -88,7 +112,11 @@ export class KruschContextClient {
       if (symRes.rows?.length > 0) {
         symbols = symRes.rows;
       }
-    } catch (_) {}
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Task symbols query failed:', err.message);
+      }
+    }
 
     // Fallback if no task symbols yet
     if (symbols.length === 0 && options.queryText) {
@@ -175,7 +203,11 @@ ${memoryLines}`;
       if (res && res.rows && res.rows.length > 0) {
         return res.rows;
       }
-    } catch (_) {}
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Primary symbol table query failed:', err.message);
+      }
+    }
 
     try {
       const legacySql = `
@@ -187,7 +219,10 @@ ${memoryLines}`;
       `;
       const res = await query(legacySql, [`%${queryTerm.trim()}%`, limit], { silent: true });
       return res.rows;
-    } catch (_) {
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Legacy symbol table query failed:', err.message);
+      }
       return [];
     }
   }
@@ -208,7 +243,11 @@ ${memoryLines}`;
       if (res && res.rows && res.rows.length > 0) {
         return res.rows;
       }
-    } catch (_) {}
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Primary memories query failed:', err.message);
+      }
+    }
 
     try {
       const legacySql = `
@@ -219,7 +258,10 @@ ${memoryLines}`;
       `;
       const res = await query(legacySql, [limit], { silent: true });
       return res.rows;
-    } catch (_) {
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Legacy memories query failed:', err.message);
+      }
       return [];
     }
   }
@@ -268,7 +310,10 @@ ${memoryLines}`;
       `;
       const res = await query(sql, [projectPath, category, content, tags, taskId]);
       return res.rows[0];
-    } catch (_) {
+    } catch (err) {
+      if (isKruschDebugEnabled()) {
+        console.warn('[KruschContextClient] Failed recording memory:', err.message);
+      }
       return null;
     }
   }

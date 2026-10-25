@@ -1,20 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import pg from 'pg';
-import dotenv from 'dotenv';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
-
-const connectionString = process.env.DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
+import { pool } from '../../src/brain/pool.js';
 
 test('Migration Engine: Sequential migrations 001->009 apply idempotently on catalog', async () => {
-  const pool = new pg.Pool({ connectionString });
   const client = await pool.connect();
+
 
   try {
     // 1. Verify krusch_schema_migrations table tracks all versioned migrations

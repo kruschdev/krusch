@@ -25,14 +25,16 @@ jobs:
       - run: npm run test:unit
       - name: Instant Failure Push Notification
         if: failure()
+      env:
+        NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
         run: |
           curl -s -X POST \
             -H "Title: 🚨 CI Failure: ${{ github.repository }} (Unit Tests - Node ${{ matrix.node-version }})" \
             -H "Priority: urgent" \
             -H "Tags: rotating_light,x" \
             -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
-            https://ntfy.sh/krusch-ci-alerts || true
+            -d "Run #${{ github.run_number }} failed on $GITHUB_REF_NAME. Commit: ${{ github.sha }} by $GITHUB_ACTOR." \
+            "${NTFY_TOPIC_URL:-}" || true
 
 
   integration-tests:
@@ -75,14 +77,16 @@ jobs:
           done
       - name: Instant Failure Push Notification
         if: failure()
+      env:
+        NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
         run: |
           curl -s -X POST \
             -H "Title: 🚨 CI Failure: ${{ github.repository }} (Integration Tests - PostgreSQL)" \
             -H "Priority: urgent" \
             -H "Tags: rotating_light,x" \
             -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
-            https://ntfy.sh/krusch-ci-alerts || true
+            -d "Run #${{ github.run_number }} failed on $GITHUB_REF_NAME. Commit: ${{ github.sha }} by $GITHUB_ACTOR." \
+            "${NTFY_TOPIC_URL:-}" || true
 
 
   typecheck:
@@ -100,12 +104,14 @@ jobs:
         run: npm pack --dry-run
       - name: Instant Failure Push Notification
         if: failure()
+      env:
+        NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
         run: |
           curl -s -X POST \
             -H "Title: 🚨 CI Failure: ${{ github.repository }} (Typecheck & Pack)" \
             -H "Priority: urgent" \
             -H "Tags: rotating_light,x" \
             -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -d "Run #${{ github.run_number }} failed on ${{ github.ref_name }}. Commit: ${{ github.sha }} by ${{ github.actor }}." \
-            https://ntfy.sh/krusch-ci-alerts || true
+            -d "Run #${{ github.run_number }} failed on $GITHUB_REF_NAME. Commit: ${{ github.sha }} by $GITHUB_ACTOR." \
+            "${NTFY_TOPIC_URL:-}" || true
 

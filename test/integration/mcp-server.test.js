@@ -297,6 +297,81 @@ test('Integration: MCP Server execution via client (krusch_run mock mode & polli
   fs.rmSync(testDir, { recursive: true, force: true });
 });
 
+test('Unit: server.registerTask rejects empty/whitespace taskId, duplicate taskId, and maxActiveTasks overflow', async () => {
+  const server = createMcpServer({ maxActiveTasks: 1 });
+
+  assert.throws(
+    () => server.registerTask('', Promise.resolve()),
+    (err) => err instanceof McpError && err.code === ErrorCode.InvalidParams && /non-empty string/i.test(err.message)
+  );
+
+  assert.throws(
+    () => server.registerTask('   ', Promise.resolve()),
+    (err) => err instanceof McpError && err.code === ErrorCode.InvalidParams && /non-empty string/i.test(err.message)
+  );
+
+  let resolvePending;
+  const pendingPromise = new Promise((r) => { resolvePending = r; });
+  server.registerTask('dup_task_1', pendingPromise);
+
+  assert.throws(
+    () => server.registerTask('other_task_2', Promise.resolve()),
+    (err) => err instanceof McpError && err.code === ErrorCode.InternalError && /Maximum active task limit reached/i.test(err.message)
+  );
+
+  const server2 = createMcpServer({ maxActiveTasks: 5 });
+  server2.registerTask('dup_task_1', pendingPromise);
+  assert.throws(
+    () => server2.registerTask('dup_task_1', Promise.resolve()),
+    (err) => err instanceof McpError && err.code === ErrorCode.InvalidParams && /Duplicate active task ID/i.test(err.message)
+  );
+
+  resolvePending();
+  await pendingPromise;
+  await server.close();
+  await server2.close();
+});
+
+test('Unit: server.close serializes active-task shutdown and rejects new tasks while shutting down (BUG-02)', async () => {
+  const server = createMcpServer({ shutdownTimeoutMs: 2000 });
+  const settledOrder = [];
+  let resolveFirst;
+  let resolveSecond;
+
+  server.registerTask(
+    'task_first',
+    new Promise((r) => {
+      resolveFirst = () => {
+        settledOrder.push('task_first');
+        r();
+      };
+    })
+  );
+  server.registerTask(
+    'task_second',
+    new Promise((r) => {
+      resolveSecond = () => {
+        settledOrder.push('task_second');
+        r();
+      };
+    })
+  );
+
+  const closePromise1 = server.close();
+  const closePromise2 = server.close();
+
+  assert.throws(
+    () => server.registerTask('task_during_close', Promise.resolve()),
+    (err) => err instanceof McpError && err.code === ErrorCode.InternalError && /shutting down/i.test(err.message)
+  );
+
+  resolveFirst();
+  resolveSecond();
+  await Promise.all([closePromise1, closePromise2]);
+  assert.deepStrictEqual(settledOrder, ['task_first', 'task_second']);
+});
+
 test.after(async () => {
   await pool.end();
 });
+

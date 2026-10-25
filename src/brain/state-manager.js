@@ -18,10 +18,18 @@ export function cleanOrphanedTempFiles(fullPath) {
       if (file.startsWith(prefix) && file.includes('-tmp-')) {
         try {
           fs.unlinkSync(path.join(targetDir, file));
-        } catch (_) {}
+        } catch (err) {
+          if (err && err.code !== 'ENOENT') {
+            console.warn(`[KruschStateManager] Failed to unlink orphaned temp file ${file}: ${err.message}`);
+          }
+        }
       }
     }
-  } catch (_) {}
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      console.warn(`[KruschStateManager] Failed to scan directory ${targetDir} for orphaned temp files: ${err.message}`);
+    }
+  }
 }
 
 /**
@@ -130,19 +138,21 @@ export class KruschStateManager {
       WHERE id = $1
       RETURNING *;
     `;
-    const res = await query(sql, values);
-    if (phase === 'COMMITTED') {
-      await query(
-        `UPDATE krusch_staged_diffs SET status = 'COMMITTED' WHERE task_id = $1 AND status = 'APPLIED'`,
-        [taskId]
-      );
-    } else if (phase === 'ABORTED') {
-      await query(
-        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
-        [taskId]
-      );
-    }
-    return res.rows[0];
+    return await withTransaction(async (client) => {
+      const res = await client.query(sql, values);
+      if (phase === 'COMMITTED') {
+        await client.query(
+          `UPDATE krusch_staged_diffs SET status = 'COMMITTED' WHERE task_id = $1 AND status = 'APPLIED'`,
+          [taskId]
+        );
+      } else if (phase === 'ABORTED') {
+        await client.query(
+          `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
+          [taskId]
+        );
+      }
+      return res.rows[0];
+    });
   }
 
   /**
@@ -685,9 +695,13 @@ export class KruschStateManager {
           if (process.env.KRUSCH_TEST_HOOK_MARKER_FILE) {
             try { fs.writeFileSync(process.env.KRUSCH_TEST_HOOK_MARKER_FILE, 'ready', 'utf-8'); } catch (_) {}
           }
+          if (process.env.KRUSCH_TEST_HOOK_SIMULATE_SIGKILL_IN_PROCESS === '1') {
+            return { abortedMidBatch: true, signal: 'SIGKILL' };
+          }
           // Pause and await SIGKILL from parent test runner
           await new Promise(resolve => setTimeout(resolve, 30000));
         }
+
       }
     } catch (renameErr) {
       // Rollback already renamed files using atomicWriteFile
@@ -1175,21 +1189,24 @@ export class KruschStateManager {
       throw new Error(`Cannot abort task '${taskId}': task is already COMMITTED.`);
     }
 
-    // Release leases on any pending or active diffs
-    await query(
-      `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
-      [taskId]
-    );
+    await withTransaction(async (client) => {
+      // Release leases on any pending or active diffs
+      await client.query(
+        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status IN ('PENDING', 'APPLYING')`,
+        [taskId]
+      );
 
-    // Transition task to ABORTED
-    await query(
-      `UPDATE krusch_tasks SET phase = 'ABORTED', metadata = metadata || $1::jsonb, updated_at = NOW() WHERE id = $2`,
-      [JSON.stringify({ abortReason: reason, abortedBy: 'operator', abortedAt: new Date().toISOString() }), taskId]
-    );
+      // Transition task to ABORTED
+      await client.query(
+        `UPDATE krusch_tasks SET phase = 'ABORTED', metadata = metadata || $1::jsonb, updated_at = NOW() WHERE id = $2`,
+        [JSON.stringify({ abortReason: reason, abortedBy: 'operator', abortedAt: new Date().toISOString() }), taskId]
+      );
 
-    await KruschStateManager.recordEvent(taskId, null, 'operator_abort', {
-      previousPhase: task.phase,
-      reason
+      await client.query(
+        `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [taskId, null, 'operator_abort', JSON.stringify({ previousPhase: task.phase, reason })]
+      );
     });
 
     return { taskId, status: 'ABORTED', reason };
@@ -1211,18 +1228,20 @@ export class KruschStateManager {
       throw new Error(`Cannot retry task '${taskId}': task is already COMMITTED to physical disk.`);
     }
 
-    // Reset phase revisits and re-open diffs if retrying
-    await query(
-      `UPDATE krusch_tasks
-       SET phase = $1, phase_revisits = 0, metadata = metadata || $2::jsonb, updated_at = NOW()
-       WHERE id = $3`,
-      [fromPhase, JSON.stringify({ retryReason: reason, retriedBy: 'operator', retriedAt: new Date().toISOString() }), taskId]
-    );
+    await withTransaction(async (client) => {
+      // Reset phase revisits and re-open diffs if retrying
+      await client.query(
+        `UPDATE krusch_tasks
+         SET phase = $1, phase_revisits = 0, metadata = metadata || $2::jsonb, updated_at = NOW()
+         WHERE id = $3`,
+        [fromPhase, JSON.stringify({ retryReason: reason, retriedBy: 'operator', retriedAt: new Date().toISOString() }), taskId]
+      );
 
-    await KruschStateManager.recordEvent(taskId, null, 'operator_retry', {
-      previousPhase: task.phase,
-      newPhase: fromPhase,
-      reason
+      await client.query(
+        `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [taskId, null, 'operator_retry', JSON.stringify({ previousPhase: task.phase, newPhase: fromPhase, reason })]
+      );
     });
 
     return { taskId, status: fromPhase, reason };
@@ -1235,21 +1254,24 @@ export class KruschStateManager {
     const task = await KruschStateManager.getTask(taskId);
     if (!task) throw new Error(`Task '${taskId}' not found.`);
 
-    if (diffId) {
-      await query(
-        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE id = $1 AND task_id = $2`,
-        [diffId, taskId]
-      );
-    } else {
-      await query(
-        `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status = 'PENDING'`,
-        [taskId]
-      );
-    }
+    await withTransaction(async (client) => {
+      if (diffId) {
+        await client.query(
+          `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE id = $1 AND task_id = $2`,
+          [diffId, taskId]
+        );
+      } else {
+        await client.query(
+          `UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE task_id = $1 AND status = 'PENDING'`,
+          [taskId]
+        );
+      }
 
-    await KruschStateManager.recordEvent(taskId, null, 'operator_reject_diff', {
-      diffId,
-      reason
+      await client.query(
+        `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [taskId, null, 'operator_reject_diff', JSON.stringify({ diffId, reason })]
+      );
     });
 
     return { taskId, diffId, status: 'REJECTED', reason };

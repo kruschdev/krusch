@@ -12,7 +12,7 @@ export const DEFAULT_SPECIALISTS = {
   general_fast: process.env.MODEL_FAST || 'google/gemini-2.5-flash',
   reasoning_deep: process.env.MODEL_REASONING || 'deepseek/deepseek-r1',
   frontier: process.env.MODEL_FRONTIER || 'anthropic/claude-3-7-sonnet',
-  local_ollama: process.env.MODEL_LOCAL || 'hermes3:8b'
+  local_ollama: process.env.MODEL_LOCAL || 'hermes3:latest'
 };
 
 export const COST_ESTIMATES = {
