@@ -237,8 +237,12 @@ export function renderFactoryControlRoomHtml() {
 <body>
   <header>
     <div class="brand">
-      <svg viewBox="0 0 96 185" width="16" height="26" fill="#00e5ff" aria-label="Krusch 13-point lightning bolt">
-        <polygon points="68,2 26,26 62,32 22,52 58,58 18,78 54,84 14,104 50,110 10,130 46,136 6,180 40,154 74,142 44,128 78,116 48,102 82,90 52,76 86,64 56,50 90,38 60,24 88,14" />
+      <svg viewBox="0 -2 132 218" width="16" height="26" aria-label="Krusch 13-point lightning bolt">
+        <defs>
+          <linearGradient id="boltGrad-factory" x1="78%" y1="4%" x2="18%" y2="96%"><stop offset="0%" stop-color="#6ff1fe"/><stop offset="24%" stop-color="#37e1ff"/><stop offset="48%" stop-color="#7be8ff"/><stop offset="72%" stop-color="#8b6eff"/><stop offset="90%" stop-color="#9d4edd"/><stop offset="100%" stop-color="#d946ef"/></linearGradient>
+          <linearGradient id="boltRim-factory" x1="80%" y1="0%" x2="15%" y2="100%"><stop offset="0%" stop-color="#bef8ff"/><stop offset="45%" stop-color="#ffffff"/><stop offset="80%" stop-color="#f5d0fe"/><stop offset="100%" stop-color="#fae8ff"/></linearGradient>
+        </defs>
+        <polygon points="121,2 79,25 93,28 48,50 78,53 19,89 58,85 5,128 44,124 5,158 34,155 4,212 47,191 35,186 70,171 52,168 105,139 66,140 123,103 74,105 128,69 86,69 126,35 102,36" fill="url(#boltGrad-factory) #37e1ff" stroke="url(#boltRim-factory)" stroke-width="2.6" stroke-linejoin="round" />
       </svg>
       <span>KRUSCH <strong>SOFTWARE FACTORY</strong> // 3-TIER CONTROL ROOM</span>
     </div>
