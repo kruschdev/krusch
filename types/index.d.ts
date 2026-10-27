@@ -360,9 +360,57 @@ export class KruschTestRunner {
 
 export class KruschApprovalPolicy {
   autoApprove: boolean;
+  floor: ReturnType<typeof createKruschPolicyFloor>;
   constructor(options?: any);
-  evaluate(toolName: string, args?: any): { status: 'AUTO_APPROVED' | 'STAGED' | 'REQUIRE_APPROVAL'; reason: string };
+  evaluate(
+    toolName: string,
+    args?: any
+  ): {
+    status: 'FORBIDDEN' | 'AUTO_APPROVED' | 'STAGED' | 'REQUIRE_APPROVAL';
+    reason: string;
+    floorRuleId?: string | null;
+  };
 }
+
+export const KRUSCH_HARDLINE_FLOOR_RULES: ReadonlyArray<any>;
+export function deobfuscateCommand(command: string): string;
+export function validateFloorRules(rules?: ReadonlyArray<any>): { valid: boolean; checked: number };
+export function createKruschPolicyFloor(options?: {
+  extraRules?: Array<any>;
+  protectedPaths?: string[];
+}): {
+  rules: ReadonlyArray<any>;
+  evaluate(
+    toolName: string,
+    args?: Record<string, any>
+  ): {
+    forbidden: boolean;
+    status: 'ALLOWED' | 'FORBIDDEN';
+    floorRuleId: string | null;
+    reason: string;
+  };
+};
+export function evaluateTruncationGuard(turnResult?: Record<string, any>): {
+  poisoned: boolean;
+  safeToExecuteTools: boolean;
+  reason: string | null;
+  truncatedCallIds: string[];
+  recoveryPrompt: string | null;
+};
+export function evaluateVerifyOnStop(state?: {
+  phase?: string;
+  toolCallsCount?: number;
+  pendingDiffsCount?: number;
+  latestRunPassed?: boolean;
+  verifyRetries?: number;
+  maxVerifyRetries?: number;
+  verificationCommand?: string | null;
+}): {
+  allowStop: boolean;
+  action: 'ALLOW_STOP' | 'FORCE_VERIFY' | 'ABORT_UNVERIFIED';
+  reason: string;
+  correctivePrompt: string | null;
+};
 
 export class KruschSymbolIndexer {
   static indexProject(projectPath: string, options?: { maxFiles?: number }): Promise<{ filesScanned: number; symbolsIndexed: number }>;

@@ -8,6 +8,14 @@ export { KruschTrajectoryGuard } from './workflow/trajectory-guard.js';
 export { KruschFailureClassifier, KruschModularRSI, RSI_MODULES } from './workflow/modular-rsi.js';
 export { KruschTestRunner } from './verify/test-runner.js';
 export { KruschApprovalPolicy } from './approvals/policy.js';
+export {
+  KRUSCH_HARDLINE_FLOOR_RULES,
+  deobfuscateCommand,
+  validateFloorRules,
+  createKruschPolicyFloor,
+  evaluateTruncationGuard,
+  evaluateVerifyOnStop
+} from './approvals/policy-floor.js';
 export { KruschFSM, HARNESS_PHASES } from './workflow/fsm.js';
 export { KruschSymbolIndexer } from './brain/indexer.js';
 export { startMcpServer } from './server/mcp-server.js';

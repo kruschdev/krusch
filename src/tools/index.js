@@ -181,6 +181,15 @@ export class KruschTools {
 
     const policyResult = this.policy.evaluate(name, args);
 
+    if (policyResult.status === 'FORBIDDEN') {
+      return {
+        status: 'BLOCKED',
+        error: 'POLICY_FLOOR_FORBIDDEN',
+        floorRuleId: policyResult.floorRuleId || null,
+        message: `Immutable Policy Floor blocked action: ${policyResult.reason}`
+      };
+    }
+
     if (policyResult.status === 'REQUIRE_APPROVAL') {
       // Record approval request in PostgreSQL
       const approval = await KruschStateManager.requestApproval(this.taskId, {

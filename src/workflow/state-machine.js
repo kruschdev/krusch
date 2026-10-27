@@ -6,6 +6,7 @@ import { KruschTools } from '../tools/index.js';
 import { KruschTrajectoryGuard } from './trajectory-guard.js';
 import { KruschFailureClassifier, RSI_ACTION_TYPES } from './modular-rsi.js';
 import { KruschApprovalPolicy } from '../approvals/policy.js';
+import { evaluateTruncationGuard, evaluateVerifyOnStop } from '../approvals/policy-floor.js';
 import { KruschFSM, HARNESS_PHASES } from './fsm.js';
 
 function getPhaseObjective(phase, verificationCommand) {
@@ -155,6 +156,7 @@ Operating Workflow Rules:
     const MAX_REMEDIATIONS = 3;
     let hasReadInPlan = false;
     let verifyFailureRevisits = 0;
+    let verifyStopRetries = 0;
     const maxPhaseRevisits = this.options.maxPhaseRevisits || 3;
 
     for (let turnNum = 1; turnNum <= maxTurns; turnNum++) {
@@ -228,6 +230,22 @@ Operating Workflow Rules:
         outputText: turnResult.text,
         toolCalls: turnResult.toolCalls
       });
+
+      // Truncation-Poisoning Guard (INV-HE-03): never execute half-truncated or malformed tool calls
+      const truncationCheck = evaluateTruncationGuard(turnResult);
+      if (truncationCheck.poisoned) {
+        console.warn(`[krusch:guard] Truncation-Poisoning Guard blocked tool execution: ${truncationCheck.reason}`);
+        await KruschStateManager.recordEvent(task.id, recordedTurn.id, 'truncation_poisoning_blocked', truncationCheck);
+        messages.push({
+          role: 'assistant',
+          content: turnResult.text || '[truncated tool output omitted]'
+        });
+        messages.push({
+          role: 'user',
+          content: truncationCheck.recoveryPrompt
+        });
+        continue;
+      }
 
       // Add assistant response to context
       messages.push({
@@ -396,6 +414,37 @@ Operating Workflow Rules:
           }
           await fsm.transitionTo(HARNESS_PHASES.IMPLEMENT);
           console.warn(`[krusch:fsm] Verification failed (attempt ${verifyFailureRevisits}/${maxPhaseRevisits}). Transitioned VERIFY -> IMPLEMENT to allow restaging.`);
+        } else if (turnResult.toolCalls.length === 0) {
+          // Verify-on-Stop Outer Loop Guard (INV-HE-04): veto premature prose stop when staged diffs remain unverified
+          const stopCheck = evaluateVerifyOnStop({
+            phase: fsm.currentPhase,
+            toolCallsCount: 0,
+            pendingDiffsCount: pendingDiffs.length,
+            latestRunPassed: false,
+            verifyRetries: verifyStopRetries,
+            maxVerifyRetries: maxPhaseRevisits,
+            verificationCommand: task.verification_command
+          });
+          if (!stopCheck.allowStop) {
+            verifyStopRetries++;
+            console.warn(`[krusch:guard] Verify-on-Stop Guard vetoed exit: ${stopCheck.reason}`);
+            await KruschStateManager.recordEvent(task.id, recordedTurn.id, 'verify_on_stop_veto', stopCheck);
+            if (stopCheck.action === 'ABORT_UNVERIFIED') {
+              await fsm.transitionTo(HARNESS_PHASES.ABORTED, { reason: stopCheck.reason });
+              return {
+                status: HARNESS_PHASES.ABORTED,
+                reason: stopCheck.reason,
+                taskId: task.id,
+                turnsExecuted: turnHistory.length,
+                stagedDiffsCount: pendingDiffs.length,
+                finalModel: route.modelId
+              };
+            }
+            messages.push({
+              role: 'user',
+              content: stopCheck.correctivePrompt
+            });
+          }
         }
       }
     }

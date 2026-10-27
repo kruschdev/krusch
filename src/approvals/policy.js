@@ -1,13 +1,27 @@
+import { createKruschPolicyFloor } from './policy-floor.js';
+
 export class KruschApprovalPolicy {
   constructor(options = {}) {
     this.autoApprove = options.autoApprove ?? (process.env.KRUSCH_AUTO_APPROVE === 'true');
+    this.floor = options.floor || createKruschPolicyFloor(options);
   }
 
   /**
-   * Evaluate if a tool action can execute immediately, be staged in DB, or require user approval.
-   * @returns {{ status: 'AUTO_APPROVED' | 'STAGED' | 'REQUIRE_APPROVAL', reason: string }}
+   * Evaluate if a tool action is hard-blocked by the policy floor, can execute immediately,
+   * be staged in DB, or require user approval.
+   * @returns {{ status: 'FORBIDDEN' | 'AUTO_APPROVED' | 'STAGED' | 'REQUIRE_APPROVAL', reason: string, floorRuleId?: string }}
    */
   evaluate(toolName, args = {}) {
+    // 0. Immutable Policy Floor (INV-HE-02): survives autoApprove / yolo modes
+    const floorDecision = this.floor.evaluate(toolName, args);
+    if (floorDecision.forbidden) {
+      return {
+        status: 'FORBIDDEN',
+        floorRuleId: floorDecision.floorRuleId,
+        reason: floorDecision.reason
+      };
+    }
+
     // 1. Read-only tools are always auto-approved
     const readOnlyTools = ['read_file', 'search_symbols', 'list_files', 'get_context', 'view_diff'];
     if (readOnlyTools.includes(toolName)) {
