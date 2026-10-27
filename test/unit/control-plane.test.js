@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   redactSecrets,
   routePipeline,
@@ -47,8 +50,38 @@ test('Control Plane: routePipeline dispatches L1 fast-path and L2 neural centroi
 });
 
 test('Control Plane: checkSibling validates ecosystem sibling repositories', () => {
-  const ctxCheck = checkSibling('krusch-context-mcp', ECOSYSTEM_SIBLINGS['krusch-context-mcp']);
-  assert.equal(ctxCheck.ok, true, `Expected krusch-context-mcp sibling check to pass: ${ctxCheck.error}`);
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'krusch-sibling-test-'));
+  const prevEnv = process.env.KRUSCH_CONTEXT_MCP;
+  try {
+    delete process.env.KRUSCH_CONTEXT_MCP;
+    const missingCheck = checkSibling('krusch-context-mcp', {
+      ...ECOSYSTEM_SIBLINGS['krusch-context-mcp'],
+      defaultPath: path.join(tmpRoot, 'does-not-exist'),
+    });
+    assert.equal(missingCheck.ok, false);
+    assert.match(missingCheck.error, /Repository directory not found/);
+
+    const validRepoDir = path.join(tmpRoot, 'krusch-context-mcp');
+    fs.mkdirSync(path.join(validRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(validRepoDir, 'src', 'index.js'), 'export default {};\n', 'utf8');
+    fs.writeFileSync(
+      path.join(validRepoDir, 'package.json'),
+      JSON.stringify({ name: 'krusch-context-mcp', version: '2.0.0' }),
+      'utf8',
+    );
+    process.env.KRUSCH_CONTEXT_MCP = validRepoDir;
+
+    const ctxCheck = checkSibling('krusch-context-mcp', ECOSYSTEM_SIBLINGS['krusch-context-mcp']);
+    assert.equal(ctxCheck.ok, true, `Expected krusch-context-mcp sibling check to pass: ${ctxCheck.error}`);
+    assert.equal(ctxCheck.currentVersion, '2.0.0');
+  } finally {
+    if (prevEnv === undefined) {
+      delete process.env.KRUSCH_CONTEXT_MCP;
+    } else {
+      process.env.KRUSCH_CONTEXT_MCP = prevEnv;
+    }
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('Control Plane: HTTP Bridge serves /api/centroids and /api/route cleanly', async () => {

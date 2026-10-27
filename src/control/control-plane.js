@@ -327,11 +327,19 @@ export async function routePipeline(prompt = '') {
   const fallbackRouter = new KruschCascadeRouter();
   const r = fallbackRouter.route(prompt);
   const durationMs = performance.now() - t0;
+  const numericConfidence =
+    typeof r.confidence === 'number'
+      ? r.confidence
+      : r.stage === 'L1_FAST_PATH'
+        ? 1.0
+        : r.confidence === 'high'
+          ? 0.92
+          : 0.85;
   return {
     stage: r.stage || 'L2_FALLBACK',
-    tier: r.role === 'architecture' ? 'heavy' : 'specialist',
+    tier: r.role === 'architecture' || r.role === 'reasoning_deep' ? 'heavy' : 'specialist',
     role: r.role,
-    confidence: r.confidence || 0.85,
+    confidence: numericConfidence,
     recommendedProvider: r.modelId?.includes('claude') ? 'anthropic' : 'gemini',
     recommendedModel: r.modelId,
     reason: r.rationale,
