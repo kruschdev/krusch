@@ -1,6 +1,6 @@
 # AGENTS.md — Krusch Coding Harness
 
-> **Project**: `krusch`
+> **Project**: `krusch-coding-harness`
 > **Maintainer**: Kevin Ruschman (KruschDev)
 > **Core Thesis**: Models are ephemeral compute; PostgreSQL is the brain. Keep workflow, context, tests, and approvals consistent while making models interchangeable.
 
@@ -36,25 +36,25 @@
 - `npm run test:integration`: PostgreSQL lifecycle, two-phase apply transaction, crash recovery, and enforcement tests.
 - `npm run typecheck`: Verify TypeScript declarations (`tsc --noEmit`).
 - `npm run migrate`: Apply versioned migrations from `db/migrations/` to PostgreSQL.
-- `./bin/krusch.js init`: Bootstrap `.env`, probe PostgreSQL connectivity, and run migrations.
-- `./bin/krusch.js doctor [sibling]`: Unified 3-Tier ecosystem & PostgreSQL control-plane healthcheck.
-- `./bin/krusch.js serve [--port 3778]`: Start headless HTTP control-plane bridge daemon (`127.0.0.1:3778`).
-- `./bin/krusch.js run "<goal>" [--mock]`: Run CLI harness.
-- `./bin/krusch.js ci [projectPath] [--patch <file>]`: Headless CI staging, sandboxed verification, and 2PC apply.
-- `./bin/krusch.js verify-models`: Verify zero-context-loss SHA-256 prefix parity across Claude, Gemini, and Ollama.
-- `./bin/krusch.js demo-invariant`: Execute 7-step write invariant & working-tree drift refusal proof.
-- `./bin/krusch.js status <taskId> [--trace]`: Deep execution trace with invariant blocker diagnostics.
-- `./bin/krusch.js explain <taskId>`: Explain why transitions or actions are allowed or blocked.
-- `./bin/krusch.js diff <taskId> [--export <file>]`: Unified diff inspector and patch exporter.
-- `./bin/krusch.js lease [list|unlock|prune]`: File concurrency lease inspection and pruning.
-- `./bin/krusch.js route "<prompt>"`: Test cascade routing decision with cost estimate.
-- `./bin/krusch.js mcp`: Run stdio MCP server.
+- `./bin/krusch-coding-harness.js init` (alias `./bin/krusch.js init`): Bootstrap `.env`, probe PostgreSQL connectivity, and run migrations.
+- `./bin/krusch-coding-harness.js doctor [sibling]`: Unified 3-Tier ecosystem & PostgreSQL control-plane healthcheck.
+- `./bin/krusch-coding-harness.js serve [--port 3778]`: Start headless HTTP control-plane bridge daemon (`127.0.0.1:3778`).
+- `./bin/krusch-coding-harness.js run "<goal>" [--mock]`: Run CLI harness.
+- `./bin/krusch-coding-harness.js ci [projectPath] [--patch <file>]`: Headless CI staging, sandboxed verification, and 2PC apply.
+- `./bin/krusch-coding-harness.js verify-models`: Verify zero-context-loss SHA-256 prefix parity across Claude, Gemini, and Ollama.
+- `./bin/krusch-coding-harness.js demo-invariant`: Execute 7-step write invariant & working-tree drift refusal proof.
+- `./bin/krusch-coding-harness.js status <taskId> [--trace]`: Deep execution trace with invariant blocker diagnostics.
+- `./bin/krusch-coding-harness.js explain <taskId>`: Explain why transitions or actions are allowed or blocked.
+- `./bin/krusch-coding-harness.js diff <taskId> [--export <file>]`: Unified diff inspector and patch exporter.
+- `./bin/krusch-coding-harness.js lease [list|unlock|prune]`: File concurrency lease inspection and pruning.
+- `./bin/krusch-coding-harness.js route "<prompt>"`: Test cascade routing decision with cost estimate.
+- `./bin/krusch-coding-harness.js mcp`: Run stdio MCP server (`krusch-harness` server key, frozen 7-tool `krusch_*` protocol).
 
 ---
 
 ## 📂 Architecture Map
 
-- `bin/krusch.js`: Unified CLI binary entry point.
+- `bin/krusch-coding-harness.js` & `bin/krusch.js`: Unified CLI binary entry points (supports `krusch-coding-harness`, `krusch-harness`, and `krusch` CLI aliases).
 - `src/control/`: Headless Control Plane (`control-plane.js`: Ecosystem Doctor, `:3778` HTTP Bridge, L1/L2 `routePipeline`, `redactSecrets`, Headless CI, Model-Switch Verifier, and 7-Step Write Invariant proof).
 - `src/brain/`: PostgreSQL state management, connection pooling, context retrieval (`krusch-context-mcp` bridge).
 - `src/router/`: Cascade router integrating `krusch-pre-router` and `krusch-cascade-router`.
@@ -69,7 +69,7 @@
 ## 🚫 Non-Goals & "Do Not Implement" Guidelines
 
 To preserve harness reliability and eliminate architectural bloat:
-1. **Do NOT build Electron or GUI shells**: Krusch is a pure headless control plane and ACID execution engine (the former `krusch-ide` / `t3code` GUI fork is retired in `projects/archive/krusch-ide`). Communication occurs exclusively via the 7-tool stdio MCP server (`./bin/krusch.js mcp`), the `:3778` HTTP bridge (`./bin/krusch.js serve`), or the CLI.
+1. **Do NOT build Electron or GUI shells**: Krusch is a pure headless control plane and ACID execution engine (the former `krusch-ide` / `t3code` GUI fork is retired in `projects/archive/krusch-ide`). Communication occurs exclusively via the 7-tool stdio MCP server (`./bin/krusch-coding-harness.js mcp` / `./bin/krusch.js mcp`), the `:3778` HTTP bridge (`./bin/krusch-coding-harness.js serve` / `./bin/krusch.js serve`), or the CLI.
 2. **Do NOT hard-depend on external git repositories for offline execution**: Routing is decoupled behind `src/router/interface.js`. Sibling packages (`krusch-context-mcp`, `krusch-git`, `krusch-pre-router`, `krusch-cascade-router`) are dynamically resolved when present, while the in-repo regex + mock gate runs out of the box with zero external dependencies.
 3. **Do NOT bypass PostgreSQL staging**: Never write or mutate files on physical disk directly from tools or model adapters. All mutations must pass through `stage_diff -> VERIFY (staged tree) -> APPROVAL_GATE -> 2PC Apply Journal`.
 4. **Do NOT allow model shell execution during IMPLEMENT**: Shell commands (`run_command`) are strictly forbidden during `PLAN` and `IMPLEMENT` phases to prevent unverified out-of-band disk mutations.

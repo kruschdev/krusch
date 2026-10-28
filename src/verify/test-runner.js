@@ -22,7 +22,7 @@ export class KruschTestRunner {
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
         // If testing against the krusch harness repo itself, default to the fast unit suite
         // to avoid infinite recursion or running long-running database integration tests
-        if (pkg.name === 'krusch') {
+        if (pkg.name === 'krusch-coding-harness' || pkg.name === 'krusch') {
           return 'npm run test:unit';
         }
         if (pkg.scripts && pkg.scripts.test) {

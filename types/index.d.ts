@@ -1,5 +1,5 @@
 /**
- * Type declarations for Krusch Coding Harness (v0.1.0).
+ * Type declarations for krusch-coding-harness (v0.1.0) — Krusch Coding Harness.
  * Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.
  */
 

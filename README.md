@@ -1,13 +1,13 @@
 <p align="center">
-  <strong>KRUSCH (v0.1.0)</strong><br>
-  <span>PostgreSQL-backed coding harness that stages diffs, runs sandboxed tests, and only then writes to disk. Models are ephemeral workers.</span>
+  <strong>KRUSCH CODING HARNESS (v0.1.0)</strong><br>
+  <span>PostgreSQL-backed coding harness (<code>krusch-coding-harness</code>) that stages diffs, runs sandboxed tests, and only then writes to disk. Models are ephemeral workers.</span>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-0.1.0-blue.svg?style=flat-square" alt="Version 0.1.0">
   <img src="https://img.shields.io/badge/Node-%3E%3D20-blue.svg?style=flat-square" alt="Node Version">
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
-  <a href="https://github.com/kruschdev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kruschdev/krusch-coding-harness/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch-coding-harness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
   <img src="https://img.shields.io/badge/tests-103%20passed-brightgreen.svg?style=flat-square" alt="Tests">
   <a href="https://hol.org/guard/extension-studio?extension=mcp.krusch"><img src="https://img.shields.io/badge/HOL_Guard-Catalog_Listed-0B0F17?style=flat-square&logo=shield&logoColor=00F5D4" alt="HOL Guard Catalog"></a>
@@ -17,7 +17,7 @@
 
 ---
 
-## What You Get If You Only Clone `krusch`
+## What You Get If You Only Clone `krusch-coding-harness`
 
 When you clone this repository, you get a fully functional, self-contained headless execution engine with **zero external cloud API dependencies**:
 
@@ -50,7 +50,7 @@ When you clone this repository, you get a fully functional, self-contained headl
 ```mermaid
 flowchart TD
     subgraph ControlPlane ["Unified Headless Control Plane"]
-        CLI["CLI (bin/krusch.js: doctor / ci / serve / bench)"]
+        CLI["CLI (bin/krusch-coding-harness.js | bin/krusch.js: doctor / ci / serve / bench)"]
         Bridge["HTTP Control Bridge (127.0.0.1:3778)"]
         MCP["MCP Server (stdio - 7 tools)"]
     end
@@ -107,7 +107,7 @@ flowchart TD
 
 Evaluated hermetically across **all `225` official `Aider-AI/polyglot-benchmark` tasks** (`cpp`, `go`, `java`, `javascript`, `python`, `rust` with mandatory upstream test un-skipping: `--include-ignored`, `xtest` → `test`, `-DEXERCISM_RUN_ALL_TESTS=1`, `@Disabled` stripped, pristine test-hash verification, and clean-workspace `.meta`/`.docs`/test exclusion) pairing open-weights `gpt-oss:120b` with `KruschSandbox` + `evaluateVerifyOnStop`:
 
-| Track | Exercises | 1-Shot `Pass@1` | **`krusch` 2PC `Verify-on-Stop` `Pass@2`** | Tasks Self-Healed | Multiplier |
+| Track | Exercises | 1-Shot `Pass@1` | **`krusch-coding-harness` 2PC `Verify-on-Stop` `Pass@2`** | Tasks Self-Healed | Multiplier |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Overall (`Aider Polyglot`)** | **`225`** | `19.56%` (`44/225`) | **`51.56%` (`116/225`)** | **`+72`** | **`2.64x` (`+32.00 pp`)** |
 | **Rust** (`cargo test -- --include-ignored`) | `30` | `36.67%` (`11/30`) | **`66.67%` (`20/30`)** | `+9` | `1.82x` |
@@ -123,31 +123,31 @@ Evaluated hermetically across **all `225` official `Aider-AI/polyglot-benchmark`
 
 ## 🚀 Quick Start (Zero Setup)
 
-You can evaluate Krusch locally in **under 10 seconds** without installing PostgreSQL, Docker, or external API keys:
+You can evaluate `krusch-coding-harness` locally in **under 10 seconds** without installing PostgreSQL, Docker, or external API keys:
 
 ### Option A: In-Process Ephemeral Mode (Recommended for testing)
 
 ```bash
 # Clone the repository
-git clone https://github.com/kruschdev/krusch.git
-cd krusch
+git clone https://github.com/kruschdev/krusch-coding-harness.git
+cd krusch-coding-harness
 npm install
 
 # Run a complete verified task in-process using PGlite + Mock adapter
-./bin/krusch.js run "Verify arithmetic module fix" --mock --ephemeral --auto-approve
+./bin/krusch-coding-harness.js run "Verify arithmetic module fix" --mock --ephemeral --auto-approve
 ```
 
-### Option B: Docker Compose (Standard homelab deployment)
+### Option B: Docker Compose (Standard deployment)
 
 ```bash
 # 1. Start PostgreSQL 16
 docker compose up -d
 
 # 2. Bootstrap database, probe connectivity, and run migrations
-./bin/krusch.js init
+./bin/krusch-coding-harness.js init
 
 # 3. Run mock task
-./bin/krusch.js run "Verify arithmetic module fix" --mock --auto-approve
+./bin/krusch-coding-harness.js run "Verify arithmetic module fix" --mock --auto-approve
 ```
 
 ---
@@ -184,60 +184,61 @@ The apply engine treats disk writes like database transactions:
 
 ## 🎛️ Operator CLI & FSM Controls
 
-Krusch provides operator commands to unstick, audit, and manage tasks:
+`krusch-coding-harness` provides operator commands to unstick, audit, and manage tasks. CLI commands support `krusch-coding-harness` as well as backwards-compatible aliases `krusch-harness` and `krusch`:
 
 ```bash
 # Check 3-Tier ecosystem health & dependencies
-krusch doctor
+krusch-coding-harness doctor
 
 # Start headless HTTP Control Bridge daemon (:3778)
-krusch serve
+krusch-coding-harness serve
 
 # Run automated Headless CI gate
-krusch ci
+krusch-coding-harness ci
 
 # Run 2PC Atomic Apply & Verification Latency Benchmark
-krusch bench
+krusch-coding-harness bench
 
 # Prove 7-Step Write Invariant & Working-Tree Drift Refusal
-krusch demo-invariant
+krusch-coding-harness demo-invariant
 
 # Verify byte-for-byte system prompt prefix parity across model wire formats
-krusch verify-models
+krusch-coding-harness verify-models
 
 # Inspect task status, blocker explanations, and SQL invariant diagnostics
-krusch status <taskId>
+krusch-coding-harness status <taskId>
 
 # Audit task trace as OpenTelemetry spans and token cost ledger
-krusch status <taskId> --json
+krusch-coding-harness status <taskId> --json
 
 # Abort an active or stuck task with audit reason
-krusch abort <taskId> --reason "Operator manual abort"
+krusch-coding-harness abort <taskId> --reason "Operator manual abort"
 
 # Retry a task from VERIFY or IMPLEMENT phase
-krusch retry <taskId> --from VERIFY
+krusch-coding-harness retry <taskId> --from VERIFY
 
 # Reject a staged diff
-krusch reject <taskId> [diffId] --reason "Style violation"
+krusch-coding-harness reject <taskId> [diffId] --reason "Style violation"
 
 # Inspect and export PR-ready unified diffs
-krusch diff <taskId>
-krusch diff <taskId> --export patch.patch
+krusch-coding-harness diff <taskId>
+krusch-coding-harness diff <taskId> --export patch.patch
 
 # Concurrency lease management
-krusch lease list
-krusch lease unlock src/calculator.js
-krusch lease prune
+krusch-coding-harness lease list
+krusch-coding-harness lease unlock src/calculator.js
+krusch-coding-harness lease prune
 ```
 
 ---
 
 ## 🔌 Model Context Protocol (MCP) Interface
 
-Krusch runs as a headless stdio MCP server for coding agents and IDEs (Antigravity, Claude Code, Cursor, Windsurf):
+`krusch-coding-harness` runs as a headless stdio MCP server for coding agents and IDEs (Antigravity, Claude Code, Cursor, Windsurf). The MCP server configuration key remains `krusch-harness` with the frozen 7-tool `krusch_*` protocol:
 
 ```bash
-./bin/krusch.js mcp
+./bin/krusch-coding-harness.js mcp
+# Backwards-compatible alias: ./bin/krusch.js mcp
 ```
 
 ### Frozen Tool Protocol

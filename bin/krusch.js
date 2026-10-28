@@ -31,10 +31,15 @@ import {
 } from '../src/control/control-plane.js';
 
 const program = new Command();
+const invokedBin = path.basename(process.argv[1] || 'krusch', '.js');
+const cliName =
+  invokedBin === 'krusch-coding-harness' || invokedBin === 'krusch-harness'
+    ? invokedBin
+    : 'krusch';
 
 program
-  .name('krusch')
-  .description('Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.')
+  .name(cliName)
+  .description('Krusch Coding Harness (krusch-coding-harness) — Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.')
   .version('0.1.0');
 
 // 1. krusch init
@@ -43,7 +48,7 @@ program
   .description('Initialize environment, probe PostgreSQL connection, and apply schema migrations')
   .option('--ephemeral', 'Initialize ephemeral in-process PostgreSQL database (zero setup)', false)
   .action(async (options) => {
-    console.log(chalk.bold.cyan('\n🚀 KRUSCH HARNESS INITIALIZATION (v0.1.0)\n'));
+    console.log(chalk.bold.cyan('\n🚀 KRUSCH CODING HARNESS INITIALIZATION (v0.1.0)\n'));
 
     if (options.ephemeral) {
       enableEphemeralMode();

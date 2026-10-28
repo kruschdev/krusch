@@ -1,5 +1,5 @@
 {
-  "name": "krusch",
+  "name": "krusch-coding-harness",
   "version": "0.1.0",
   "description": "Postgres-backed coding harness that stages diffs, runs tests, and only then writes the working tree.",
   "type": "module",
@@ -15,6 +15,8 @@
     "docker-compose.yml"
   ],
   "bin": {
+    "krusch-coding-harness": "./bin/krusch.js",
+    "krusch-harness": "./bin/krusch.js",
     "krusch": "./bin/krusch.js"
   },
   "scripts": {
@@ -39,11 +41,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kruschdev/krusch.git"
+    "url": "git+https://github.com/kruschdev/krusch-coding-harness.git"
   },
-  "homepage": "https://github.com/kruschdev/krusch#readme",
+  "homepage": "https://github.com/kruschdev/krusch-coding-harness#readme",
   "bugs": {
-    "url": "https://github.com/kruschdev/krusch/issues"
+    "url": "https://github.com/kruschdev/krusch-coding-harness/issues"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.8",

@@ -6,7 +6,7 @@ export class OpenRouterAdapter extends BaseModelAdapter {
     super(options);
     this.apiKey = options.apiKey || process.env.OPENROUTER_API_KEY;
     this.baseUrl = options.baseUrl || 'https://openrouter.ai/api/v1';
-    this.siteUrl = options.siteUrl || 'https://github.com/kruschdev/krusch';
+    this.siteUrl = options.siteUrl || 'https://github.com/kruschdev/krusch-coding-harness';
     this.siteName = options.siteName || 'Krusch Coding Harness';
   }
 
