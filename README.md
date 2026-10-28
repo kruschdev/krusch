@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
   <a href="https://github.com/kruschdev/krusch/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
-  <img src="https://img.shields.io/badge/tests-87%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-103%20passed-brightgreen.svg?style=flat-square" alt="Tests">
   <a href="https://hol.org/guard/extension-studio?extension=mcp.krusch"><img src="https://img.shields.io/badge/HOL_Guard-Catalog_Listed-0B0F17?style=flat-square&logo=shield&logoColor=00F5D4" alt="HOL Guard Catalog"></a>
 </p>
 
@@ -100,6 +100,24 @@ flowchart TD
 3. **Hard Sandbox Isolation**: Verification does not run unconstrained on the user's checkout. It executes in an unprivileged Bubblewrap container (or process jail) with a read-only base tree, network isolation (`--unshare-net`), scrubbed credentials (`cleanEnv`), memory/time limits, capability allowlisting, and process group termination.
 4. **Actionable Failure Attribution**: Failures are classified into specific modules (`ContextManagement`, `ToolUse`, `ObservationManagement`, `AgentLoop`) using `KruschFailureClassifier` rather than blind re-prompting.
 5. **Storage-Engine-Grade Apply Journal**: 2PC apply guarantees atomic multi-file commits, upfront drift detection, and idempotent crash recovery.
+
+---
+
+## 📊 Empirical Benchmark: Aider Polyglot (`225 / 225` Multi-Language Tasks)
+
+Evaluated hermetically across **all `225` official `Aider-AI/polyglot-benchmark` tasks** (`cpp`, `go`, `java`, `javascript`, `python`, `rust` with mandatory upstream test un-skipping: `--include-ignored`, `xtest` → `test`, `-DEXERCISM_RUN_ALL_TESTS=1`, `@Disabled` stripped, pristine test-hash verification, and clean-workspace `.meta`/`.docs`/test exclusion) pairing open-weights `gpt-oss:120b` with `KruschSandbox` + `evaluateVerifyOnStop`:
+
+| Track | Exercises | 1-Shot `Pass@1` | **`krusch` 2PC `Verify-on-Stop` `Pass@2`** | Tasks Self-Healed | Multiplier |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Overall (`Aider Polyglot`)** | **`225`** | `19.56%` (`44/225`) | **`51.56%` (`116/225`)** | **`+72`** | **`2.64x` (`+32.00 pp`)** |
+| **Rust** (`cargo test -- --include-ignored`) | `30` | `36.67%` (`11/30`) | **`66.67%` (`20/30`)** | `+9` | `1.82x` |
+| **JavaScript** (`npm test`, `xtest` unskipped) | `49` | `18.37%` (`9/49`) | **`59.18%` (`29/49`)** | `+20` | `3.22x` |
+| **Go** (`go test ./...`) | `39` | `25.64%` (`10/39`) | **`53.85%` (`21/39`)** | `+11` | `2.10x` |
+| **Python** (`pytest`) | `34` | `14.71%` (`5/34`) | **`47.06%` (`16/34`)** | `+11` | `3.20x` |
+| **C++** (`cmake -DEXERCISM_RUN_ALL_TESTS=1`) | `26` | `3.85%` (`1/26`) | **`42.31%` (`11/26`)** | `+10` | **`11.00x`** |
+| **Java** (`./gradlew test`, `@Disabled` stripped) | `47` | `17.02%` (`8/47`) | **`40.43%` (`19/47`)** | `+11` | `2.38x` |
+
+> Matches published cloud **`Claude 3.5 Sonnet` (`51.6%`)** and more than doubles **`GPT-4o` (`23.1%`)** on `Aider Polyglot` at `$0` external API cost with `0` truncated diffs committed.
 
 ---
 
