@@ -17,6 +17,10 @@ import { KruschVerificationContract } from '../verify/contract.js';
 import { generateUnifiedDiff } from '../utils/diff-patch.js';
 import { query } from '../brain/pool.js';
 import { renderFactoryControlRoomHtml } from './factory-ui.js';
+import { AsyncHitlSlackGate } from '../approvals/hitl-slack-gate.js';
+import { CostKillSwitchMiddleware } from '../router/cost-killswitch.js';
+import { ApiToBrowserFallbackAgent } from '../tools/api-browser-fallback.js';
+import { runTrajectoryEvalGate } from '../eval/trajectory-dag-gate.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -532,6 +536,15 @@ export async function runDoctor(options = {}) {
 export function startBridgeServer(options = {}) {
   const port = Number(options.port ?? process.env.BRIDGE_PORT ?? 3778);
   const host = options.host || process.env.BRIDGE_HOST || '127.0.0.1';
+  const hitlGate =
+    options.hitlGate ||
+    new AsyncHitlSlackGate({
+      stateFilePath: options.hitlStateFilePath || null,
+      signingSecret: options.slackSigningSecret ?? process.env.SLACK_SIGNING_SECRET ?? '',
+    });
+  const costGuard = options.costGuard || new CostKillSwitchMiddleware(options.costOptions || {});
+  const browserFallback =
+    options.browserFallback || new ApiToBrowserFallbackAgent(options.fallbackOptions || {});
 
   const isTrustedBridgeOrigin = (origin) => {
     if (!origin) return true;
@@ -564,33 +577,78 @@ export function startBridgeServer(options = {}) {
       return;
     }
 
+    const url = new URL(req.url, `http://${host}:${port}`);
     const bridgeToken = process.env.KRUSCH_BRIDGE_TOKEN;
-    if (bridgeToken && req.method === 'POST') {
+    if (bridgeToken && req.method === 'POST' && url.pathname !== '/api/hitl/slack-webhook') {
       const authHeader = req.headers.authorization || '';
       const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-      if (provided !== bridgeToken) {
+      const expectedBuf = Buffer.from(bridgeToken, 'utf8');
+      const providedBuf = Buffer.from(provided, 'utf8');
+      const validToken =
+        providedBuf.length === expectedBuf.length &&
+        crypto.timingSafeEqual(providedBuf, expectedBuf);
+      if (!validToken) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized: Valid KRUSCH_BRIDGE_TOKEN required.' }));
         return;
       }
     }
 
-    const url = new URL(req.url, `http://${host}:${port}`);
-    const readBody = () =>
+    const maxBodyBytes = Math.max(
+      1024,
+      Number(options.maxBodyBytes || process.env.KRUSCH_MAX_BODY_BYTES || 2 * 1024 * 1024),
+    );
+
+    const readRawBody = () =>
       new Promise((resolve, reject) => {
-        let data = '';
+        const declaredLen = Number(req.headers['content-length'] || 0);
+        if (Number.isFinite(declaredLen) && declaredLen > maxBodyBytes) {
+          const err = new Error(`Payload Too Large: exceeds ${maxBodyBytes} byte limit`);
+          err.statusCode = 413;
+          req.resume();
+          reject(err);
+          return;
+        }
+        const chunks = [];
+        let totalBytes = 0;
+        let settled = false;
         req.on('data', (chunk) => {
-          data += chunk;
+          if (settled) return;
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+          totalBytes += buf.length;
+          if (totalBytes > maxBodyBytes) {
+            settled = true;
+            const err = new Error(`Payload Too Large: exceeds ${maxBodyBytes} byte limit`);
+            err.statusCode = 413;
+            req.pause();
+            reject(err);
+            return;
+          }
+          chunks.push(buf);
         });
         req.on('end', () => {
-          try {
-            resolve(data ? JSON.parse(data) : {});
-          } catch (e) {
-            reject(e);
-          }
+          if (settled) return;
+          settled = true;
+          resolve(Buffer.concat(chunks).toString('utf8'));
         });
-        req.on('error', reject);
+        req.on('error', (err) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        });
       });
+
+    const readBody = async () => {
+      const data = await readRawBody();
+      if (!data || !data.trim()) return {};
+      try {
+        return JSON.parse(data);
+      } catch (_parseErr) {
+        const err = new Error('Invalid JSON request body');
+        err.statusCode = 400;
+        throw err;
+      }
+    };
 
     try {
       if ((url.pathname === '/' || url.pathname === '/factory') && req.method === 'GET') {
@@ -809,11 +867,86 @@ export function startBridgeServer(options = {}) {
         return;
       }
 
+      if (url.pathname === '/api/hitl/draft' && req.method === 'POST') {
+        const body = await readBody();
+        const result = hitlGate.draftAction(body || {});
+        res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (url.pathname === '/api/hitl/status' && req.method === 'GET') {
+        const gateId = url.searchParams.get('gateId');
+        const result = hitlGate.getGateStatus(gateId || '');
+        res.writeHead(result.ok ? 200 : 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (url.pathname === '/api/hitl/slack-webhook' && req.method === 'POST') {
+        const rawBody = await readRawBody();
+        const result = await hitlGate.handleSlackWebhook({
+          rawBody,
+          headers: req.headers,
+          signingSecret: options.slackSigningSecret ?? process.env.SLACK_SIGNING_SECRET ?? '',
+          onResume: options.onHitlResume || null,
+        });
+        const status = result.ok
+          ? 200
+          : result.data?.status === 'UNAUTHORIZED_SIGNATURE'
+            ? 401
+            : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (url.pathname === '/api/cost/evaluate' && req.method === 'POST') {
+        const body = await readBody();
+        const result = costGuard.evaluatePreTurn(body || {});
+        res.writeHead(result.ok ? 200 : 402, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (url.pathname === '/api/cost/record' && req.method === 'POST') {
+        const body = await readBody();
+        const result = costGuard.recordTurnSpend(body || {});
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (url.pathname === '/api/fallback/execute' && req.method === 'POST') {
+        const body = await readBody();
+        const result = await browserFallback.execute(body || {});
+        res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (url.pathname === '/api/eval/trajectories' && req.method === 'POST') {
+        const body = await readBody();
+        const result = runTrajectoryEvalGate(body || {});
+        res.writeHead(result.ok ? 200 : 422, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Endpoint not found' }));
     } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      const statusCode = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
+      const headers = { 'Content-Type': 'application/json' };
+      if (statusCode === 413) {
+        headers.Connection = 'close';
+      }
+      res.writeHead(statusCode, headers);
+      res.end(JSON.stringify({ error: err.message }), () => {
+        if (statusCode === 413 && !req.complete) {
+          req.destroy();
+        }
+      });
     }
   });
 

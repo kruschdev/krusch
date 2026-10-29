@@ -5,11 +5,34 @@
   "type": "module",
   "main": "src/index.js",
   "types": "types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./hitl": {
+      "types": "./types/agentic-15.d.ts",
+      "default": "./src/approvals/hitl-slack-gate.js"
+    },
+    "./cost-killswitch": {
+      "types": "./types/agentic-15.d.ts",
+      "default": "./src/router/cost-killswitch.js"
+    },
+    "./browser-fallback": {
+      "types": "./types/agentic-15.d.ts",
+      "default": "./src/tools/api-browser-fallback.js"
+    },
+    "./trajectory-eval": {
+      "types": "./types/agentic-15.d.ts",
+      "default": "./src/eval/trajectory-dag-gate.js"
+    }
+  },
   "files": [
     "bin",
     "src",
     "db",
     "types",
+    "test/fixtures/golden-trajectories-100.json",
     "LICENSE",
     "README.md",
     "docker-compose.yml"
@@ -25,6 +48,7 @@
     "test": "node --test --test-concurrency=1 test/unit/*.test.js test/integration/*.test.js",
     "test:unit": "node --test test/unit/*.test.js",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.js",
+    "eval:trajectories": "node bin/krusch.js eval-trajectories --strict",
     "migrate": "node db/migrate.js",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit"

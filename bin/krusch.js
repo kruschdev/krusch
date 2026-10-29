@@ -29,6 +29,7 @@ import {
   runInvariantDemo,
   runBenchmark,
 } from '../src/control/control-plane.js';
+import { runTrajectoryEvalGate } from '../src/eval/trajectory-dag-gate.js';
 
 const program = new Command();
 const invokedBin = path.basename(process.argv[1] || 'krusch', '.js');
@@ -668,6 +669,47 @@ program
       process.exit(0);
     } catch (err) {
       console.error(chalk.red(`\n✗ Benchmark Error: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// 17. krusch eval-trajectories
+program
+  .command('eval-trajectories')
+  .description('Replay golden agent trajectories and block CI if tool-call sequences deviate from the Golden DAG')
+  .option('-f, --fixture <path>', 'Custom trajectory JSON fixture path')
+  .option('-m, --min-count <count>', 'Minimum required trajectory count', '100')
+  .option('--strict', 'Exit non-zero on any DAG violation or fixture shrinkage', true)
+  .option('--json', 'Emit raw JSON evaluation envelope', false)
+  .action((options) => {
+    try {
+      const report = runTrajectoryEvalGate({
+        fixturePath: options.fixture ? path.resolve(options.fixture) : undefined,
+        minRequiredCount: parseInt(options.minCount, 10) || 100,
+      });
+
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(chalk.bold.cyan('\n🛡️  KRUSCH GOLDEN DAG TRAJECTORY CI GATE\n'));
+        console.log(`  Status    : ${report.ok ? chalk.bold.green('PASSED') : chalk.bold.red('BLOCKED')}`);
+        console.log(`  Summary   : ${report.summary}`);
+        console.log(`  Evaluated : ${report.data.passed}/${report.data.total} (${(report.data.passRate * 100).toFixed(2)}%)`);
+        if (report.data.failures && report.data.failures.length > 0) {
+          console.log(chalk.red('\n  Golden DAG Violations:'));
+          for (const fail of report.data.failures.slice(0, 10)) {
+            const formatted = (fail.violations || [])
+              .map((v) => (typeof v === 'string' ? v : `${v.rule}: ${v.message}`))
+              .join('; ');
+            console.log(chalk.red(`    ✗ [${fail.id}] (${fail.category}): ${formatted}`));
+          }
+        }
+        console.log('');
+      }
+
+      process.exit(report.ok ? 0 : 1);
+    } catch (err) {
+      console.error(chalk.red(`\n✗ Trajectory Eval CI Gate Error: ${err.message}\n`));
       process.exit(1);
     }
   });
