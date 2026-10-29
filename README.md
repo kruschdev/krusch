@@ -106,7 +106,11 @@ flowchart TD
 
 ---
 
-## 📊 Empirical Benchmark: Aider Polyglot (`225 / 225` Multi-Language Tasks)
+## 📊 Empirical Benchmarks (`68/68` Clean-Room SHA-256 Gates)
+
+All raw per-query/per-episode audit logs and `SHA-256` provenance digests are published openly on Hugging Face at [**`krush420/sovereign-g4-benchmarks`**](https://huggingface.co/datasets/krush420/sovereign-g4-benchmarks) and interactively at [**`krush420/sovereign-router-arena`**](https://huggingface.co/spaces/krush420/sovereign-router-arena).
+
+### 1. Aider Polyglot (`225 / 225` Multi-Language Coding Tasks)
 
 Evaluated hermetically across **all `225` official `Aider-AI/polyglot-benchmark` tasks** (`cpp`, `go`, `java`, `javascript`, `python`, `rust` with mandatory upstream test un-skipping: `--include-ignored`, `xtest` → `test`, `-DEXERCISM_RUN_ALL_TESTS=1`, `@Disabled` stripped, pristine test-hash verification, and clean-workspace `.meta`/`.docs`/test exclusion) pairing open-weights `gpt-oss:120b` with `KruschSandbox` + `evaluateVerifyOnStop`:
 
@@ -121,6 +125,28 @@ Evaluated hermetically across **all `225` official `Aider-AI/polyglot-benchmark`
 | **Java** (`./gradlew test`, `@Disabled` stripped) | `47` | `17.02%` (`8/47`) | **`40.43%` (`19/47`)** | `+11` | `2.38x` |
 
 > Matches published cloud **`Claude 3.5 Sonnet` (`51.6%`)** and more than doubles **`GPT-4o` (`23.1%`)** on `Aider Polyglot` at `$0` external API cost with `0` truncated diffs committed.
+
+### 2. BIRD-SQL Mini-Dev (`500 / 500` Dirty Enterprise SQLite Queries × `11` Databases)
+
+Evaluated across **all `500` official `birdsql/bird_mini_dev` queries** (`11` SQLite databases, runtime JS `Proxy` blocking `.SQL` / `.gold_sql`, read-only `DatabaseSync(..., { readOnly: true })` schema/FK/cell-value grounding, `createKruschPolicyFloor` DDL/DML blocklist, and `evaluateVerifyOnStop` execution-error / empty-set self-healing on `gpt-oss:120b`):
+
+| Strategy | Queries | Execution Accuracy (`EX`) | `R-VES` | Valid Executable SQL | `Verify-on-Stop` Healed |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `raw_ddl_oneshot` (Raw `CREATE TABLE` DDL Only) | `500` | `26.00%` (`130/500`) | `24.15%` | `97.80%` | `0` |
+| `schema_value_grounded_pass1` (FK + Sample Cell Grounded) | `500` | `37.60%` (`188/500`) | `33.30%` | `99.40%` | `0` |
+| **`krusch_2pc_sql_heal` (`krusch-coding-harness` 2PC)** | **`500`** | **`40.20%` (`201/500`, `1.55x`)** | **`35.75%`** | **`100.00%` (`500/500`)** | **`+13` (`45` retries = `0.09`/q)** |
+
+> Lifts `toxicology` **`5.00x`** (`12.50%` → **`62.50%`**), `moderate` difficulty from `32.40%` → **`50.00%`**, and `challenging` difficulty from `27.87%` → **`39.35%`** while eliminating `100%` of invalid/syntax-errored SQL.
+
+### 3. ETH SpyLab AgentDojo v1.2.2 (`1,046 / 1,046` Indirect Prompt-Injection Episodes)
+
+Evaluated across **all `1,046` official `ethz-spylab/agentdojo` (`v1.2.2`) episodes** (`97` benign user tasks + `949` `ImportantInstructionsAttack` adversarial episodes across `workspace`, `banking`, `slack`, and `travel` on `gpt-oss:120b`, zero hardcoded benchmark tokens):
+
+| Defense Strategy | Benign Utility (`n=97`) | Attacked Utility (`n=949`) | **Targeted Attack Success Rate (`ASR` ↓)** | Defense Rate (`↑`) | Policy-Floor Blocks |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `raw_unprotected_agent` (No Guard) | `61.86%` (`60/97`) | `55.32%` | `19.28%` (`183/949` hijacked) | `80.72%` | `0` |
+| `spotlighting_delimited_only` (`<UNTRUSTED_CONTENT>` Only) | `69.07%` (`67/97`) | `54.58%` | `14.86%` (`141/949` hijacked) | `85.14%` | `0` |
+| **`krusch_sovereign_defense` (`createKruschPolicyFloor` + Taint Guard)** | **`61.86%` (`0.00 pp` loss)** | `49.95%` | **`0.00%` (`0/949` hijacked)** | **`100.00%`** | **`83`** |
 
 ---
 
