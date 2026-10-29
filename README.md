@@ -8,8 +8,10 @@
   <img src="https://img.shields.io/badge/Node-%3E%3D20-blue.svg?style=flat-square" alt="Node Version">
   <img src="https://img.shields.io/badge/PostgreSQL-16%20ACID-blue.svg?style=flat-square" alt="PostgreSQL">
   <a href="https://github.com/kruschdev/krusch-coding-harness/actions/workflows/ci.yml"><img src="https://github.com/kruschdev/krusch-coding-harness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kruschdev/krusch-coding-harness/actions/workflows/trajectory-eval.yml"><img src="https://github.com/kruschdev/krusch-coding-harness/actions/workflows/trajectory-eval.yml/badge.svg" alt="Trajectory Eval CI Gate"></a>
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT">
-  <img src="https://img.shields.io/badge/tests-103%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-108%20passed-brightgreen.svg?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/golden%20DAG-100%2F100-brightgreen.svg?style=flat-square" alt="Golden DAG 100/100">
   <a href="https://hol.org/guard/extension-studio?extension=mcp.krusch"><img src="https://img.shields.io/badge/HOL_Guard-Catalog_Listed-0B0F17?style=flat-square&logo=shield&logoColor=00F5D4" alt="HOL Guard Catalog"></a>
 </p>
 
@@ -32,11 +34,12 @@ When you clone this repository, you get a fully functional, self-contained headl
 │  ✓ Two-Phase Commit Apply Journal: Crash-safe fsync + atomic rename    │
 │  ✓ In-Memory Postgres: Zero-setup local evaluation via PGlite          │
 │  ✓ AST Symbol Indexer: JS, TS, Python, Go, Rust structural symbols     │
-│  ✓ Operator Controls: CLI/MCP abort, retry, reject, explain status    │
+│  ✓ Async HITL Slack Gate: 72h lease + fail-closed HMAC-SHA256 resume   │
+│  ✓ $0.50 Cost Kill-Switch: Loop-depth & local Ollama fallback router   │
+│  ✓ API-to-Browser Fallback: SSRF-hardened REST ➔ GUI failover          │
+│  ✓ Golden DAG CI Gate: 100-trajectory PR blocker across 10 categories  │
 │  ✓ OpenTelemetry Spans & Cost Ledger: Audit trace JSON per task       │
-│  ✓ Real PR-Ready Patch Export: Myers unified diff for git apply       │
-│  ✓ Unified Control Plane: Doctor, :3778 HTTP Bridge & Headless CI     │
-│  ✓ Stdio MCP Server: 7-tool agent bridge with Invariant #567 hints    │
+│  ✓ Unified Control Plane: Doctor, :3778 HTTP Bridge & 7-Tool MCP       │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -228,7 +231,24 @@ krusch-coding-harness diff <taskId> --export patch.patch
 krusch-coding-harness lease list
 krusch-coding-harness lease unlock src/calculator.js
 krusch-coding-harness lease prune
+
+# Replay all 100 golden trajectories across 10 categories (Golden DAG CI Gate)
+krusch-coding-harness eval-trajectories --strict
+krusch-coding-harness eval-trajectories --json
 ```
+
+---
+
+## 🛡️ Production Agentic Safety, Resilience & Golden DAG CI Systems
+
+`krusch-coding-harness` exports four standalone zero-cloud-dependency subpath modules (`types/agentic-15.d.ts` typed) and exposes matching `:3778` HTTP Control Bridge endpoints (full state-machine design in [**Paper #23 — The 15 Production Agentic Systems**](https://krusch.dev/articles/fifteen-production-agent-systems)):
+
+| Subpath Import | Core Class / Runner | Production Invariants & `:3778` Control Bridge Routes |
+| :--- | :--- | :--- |
+| `krusch-coding-harness/hitl` | `AsyncHitlSlackGate` (`src/approvals/hitl-slack-gate.js`) | Serializes high-stakes mutations to crash-safe `.tmp` + `renameSync` state journals with a **72-hour (`259,200,000 ms`)** approval lease (`PENDING_APPROVAL → APPROVED \| REJECTED \| EXPIRED`) and fail-closed `crypto.timingSafeEqual` Slack `v0=` HMAC-SHA256 signature + `±300s` replay window verification (`POST /api/hitl/draft`, `GET /api/hitl/status`, `POST /api/hitl/slack-webhook`). |
+| `krusch-coding-harness/cost-killswitch` | `CostKillSwitchMiddleware` (`src/router/cost-killswitch.js`) | Tracks per-task `loopDepth`, cumulative `spentUsd`, and worst-case `projectedTurnUsd`; automatically downgrades paid frontier calls to `$0.00` sovereign local `qwen2.5-coder:7b` before breaching `$0.50` and hard-halts paid spend at `$0.50` (`POST /api/cost/evaluate`, `POST /api/cost/record`). |
+| `krusch-coding-harness/browser-fallback` | `ApiToBrowserFallbackAgent` (`src/tools/api-browser-fallback.js`) | Executes primary REST calls with deterministic `AbortController` timeouts; seamlessly fails over to headless browser GUI workflows on `404`/`408`/`429`/`5xx`/network timeouts while failing closed on `400`/`401`/`403` client errors and blocking IPv4/IPv6-mapped (`::ffff:*`, `fd00:ec2::254`, `169.254.169.254`) SSRF targets (`POST /api/fallback/execute`). |
+| `krusch-coding-harness/trajectory-eval` | `runTrajectoryEvalGate` (`src/eval/trajectory-dag-gate.js`) | Replays **100 golden trajectories across 10 categories** (`test/fixtures/golden-trajectories-100.json`) in GitHub Actions (`.github/workflows/trajectory-eval.yml`), blocking PRs on `requiredTools`, `forbiddenTools`, `precedenceEdges`, `requirePassingPrerequisite` (`ok === true`), `argGuards`, or `maxSteps` violations (`POST /api/eval/trajectories`). |
 
 ---
 
@@ -257,19 +277,22 @@ krusch-coding-harness lease prune
 
 ## 🧪 Verification & Test Suite
 
-The test suite exercises unit behavior, storage engine properties, sandbox isolation, and PostgreSQL integration:
+The test suite exercises unit behavior, storage engine properties, sandbox isolation, PostgreSQL integration, and the 100-trajectory Golden DAG gate:
 
 ```bash
-# Run fast unit tests (AST indexer, router heuristics, sandbox allowlist, RSI, control plane)
+# Run fast unit tests (51 tests across AST indexer, router heuristics, HITL, cost kill-switch, browser fallback, DAG gate)
 npm run test:unit
+
+# Replay all 100 golden trajectories across 10 production categories
+npm run eval:trajectories
 
 # Run storage engine property & PostgreSQL integration tests
 npm run test:integration
 
-# Run full test suite (87 tests across unit, integration, and ephemeral)
+# Run full test suite (108 tests across unit, integration, and ephemeral)
 npm test
 
-# Verify TypeScript declarations (zero errors)
+# Verify TypeScript declarations (zero errors across types/index.d.ts & types/agentic-15.d.ts)
 npm run typecheck
 
 # Check package manifest and npm pack contents
