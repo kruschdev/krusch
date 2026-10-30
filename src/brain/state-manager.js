@@ -4,22 +4,122 @@ import crypto from 'crypto';
 import { query, withTransaction } from './pool.js';
 import { KruschTestRunner } from '../verify/test-runner.js';
 
+const BENIGN_DIR_FSYNC_CODES = new Set(['EINVAL', 'EBADF', 'EISDIR', 'ENOTSUP', 'EPERM']);
+
+/**
+ * Flush parent directory metadata after atomic rename or unlink so directory entries
+ * survive power loss. Tolerates filesystems/OSes that reject directory fsync while
+ * propagating genuine I/O or resource errors (EIO, ENOSPC, ENOMEM).
+ */
+export function fsyncDirectory(dirPath, fsOps = fs) {
+  let fd;
+  try {
+    fd = fsOps.openSync(dirPath, 'r');
+  } catch (openErr) {
+    if (openErr && BENIGN_DIR_FSYNC_CODES.has(openErr.code)) {
+      return;
+    }
+    throw openErr;
+  }
+  try {
+    fsOps.fsyncSync(fd);
+  } catch (fsyncErr) {
+    if (fsyncErr && BENIGN_DIR_FSYNC_CODES.has(fsyncErr.code)) {
+      return;
+    }
+    throw fsyncErr;
+  } finally {
+    try {
+      fsOps.closeSync(fd);
+    } catch (closeErr) {
+      if (closeErr && closeErr.code !== 'EBADF') {
+        console.warn(`[KruschStateManager] Failed to close directory fd for ${dirPath}: ${closeErr.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * Read a UTF-8 file directly without `fs.existsSync` so transient OS errors
+ * (EIO, EACCES, ENOMEM, EMFILE) propagate rather than masquerading as missing files.
+ */
+function readTextIfExists(filePath, fsOps = fs) {
+  try {
+    const content = fsOps.readFileSync(filePath, 'utf-8');
+    return { exists: true, content };
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return { exists: false, content: null };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Unlink a file if present, ignoring strictly ENOENT and propagating EACCES/EIO/EBUSY.
+ * Returns true when an existing directory entry was unlinked, false when already absent.
+ */
+function unlinkIfExists(filePath, fsOps = fs) {
+  try {
+    fsOps.unlinkSync(filePath);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Write a complete UTF-8 buffer to fd, looping across partial POSIX write(2) calls
+ * on near-ENOSPC filesystems so truncated blocks are never fsynced/renamed.
+ */
+function writeAllSync(fd, content, tempPath, fsOps = fs) {
+  const payload = Buffer.isBuffer(content)
+    ? content
+    : content instanceof Uint8Array
+      ? Buffer.from(content)
+      : Buffer.from(String(content ?? ''), 'utf8');
+
+  if (payload.length === 0) {
+    fsOps.writeSync(fd, payload, 0, 0);
+    return;
+  }
+
+  let offset = 0;
+  while (offset < payload.length) {
+    const written = fsOps.writeSync(fd, payload, offset, payload.length - offset);
+    if (typeof written !== 'number') {
+      return;
+    }
+    if (written <= 0) {
+      const shortWriteErr = new Error(`Short write (0 bytes) to temporary file: ${tempPath}`);
+      shortWriteErr.code = 'EIO';
+      throw shortWriteErr;
+    }
+    offset += written;
+  }
+}
+
 /**
  * Clean up orphaned temporary files matching .${basename}.krusch-*-tmp-*
+ * Propagates directory I/O errors (EIO, EACCES) when throwOnIoError is true.
  */
-export function cleanOrphanedTempFiles(fullPath) {
+export function cleanOrphanedTempFiles(fullPath, fsOps = fs, { throwOnIoError = false } = {}) {
   const targetDir = path.dirname(fullPath);
   const baseName = path.basename(fullPath);
-  if (!fs.existsSync(targetDir)) return;
   try {
-    const entries = fs.readdirSync(targetDir);
+    const entries = fsOps.readdirSync(targetDir);
     const prefix = `.${baseName}.krusch-`;
-    for (const file of entries) {
-      if (file.startsWith(prefix) && file.includes('-tmp-')) {
+    for (const entry of entries) {
+      const file = typeof entry === 'string' ? entry : entry?.name;
+      if (file && file.startsWith(prefix) && file.includes('-tmp-')) {
         try {
-          fs.unlinkSync(path.join(targetDir, file));
+          fsOps.unlinkSync(path.join(targetDir, file));
         } catch (err) {
           if (err && err.code !== 'ENOENT') {
+            if (throwOnIoError) throw err;
             console.warn(`[KruschStateManager] Failed to unlink orphaned temp file ${file}: ${err.message}`);
           }
         }
@@ -27,24 +127,52 @@ export function cleanOrphanedTempFiles(fullPath) {
     }
   } catch (err) {
     if (err && err.code !== 'ENOENT') {
+      if (throwOnIoError) throw err;
       console.warn(`[KruschStateManager] Failed to scan directory ${targetDir} for orphaned temp files: ${err.message}`);
     }
   }
 }
 
 /**
- * Write a file atomically using a temporary sibling file, fsync, and atomic POSIX rename.
+ * Write a file atomically using a temporary sibling file, full-buffer write loop, fsync,
+ * atomic POSIX rename, and parent directory fsync. Never leaks file descriptors or partial temp files.
  */
-export function atomicWriteFile(targetPath, content) {
+export function atomicWriteFile(targetPath, content, fsOps = fs) {
   const targetDir = path.dirname(targetPath);
-  fs.mkdirSync(targetDir, { recursive: true });
+  fsOps.mkdirSync(targetDir, { recursive: true });
   const randSuffix = crypto.randomBytes(4).toString('hex');
   const tempPath = path.resolve(targetDir, `.${path.basename(targetPath)}.krusch-atomic-tmp-${Date.now()}-${randSuffix}`);
-  const fd = fs.openSync(tempPath, 'w');
-  fs.writeSync(fd, content);
-  fs.fsyncSync(fd);
-  fs.closeSync(fd);
-  fs.renameSync(tempPath, targetPath);
+  const fd = fsOps.openSync(tempPath, 'w');
+  try {
+    let writeErr = null;
+    try {
+      writeAllSync(fd, content, tempPath, fsOps);
+      fsOps.fsyncSync(fd);
+    } catch (err) {
+      writeErr = err;
+      throw err;
+    } finally {
+      try {
+        fsOps.closeSync(fd);
+      } catch (closeErr) {
+        if (!writeErr) {
+          throw closeErr;
+        }
+        console.warn(`[KruschStateManager] Failed to close fd for ${tempPath} after write/fsync error: ${closeErr.message}`);
+      }
+    }
+    fsOps.renameSync(tempPath, targetPath);
+  } catch (err) {
+    try {
+      fsOps.unlinkSync(tempPath);
+    } catch (unlinkErr) {
+      if (unlinkErr && unlinkErr.code !== 'ENOENT') {
+        console.warn(`[KruschStateManager] Failed to unlink partial atomic temp file ${tempPath}: ${unlinkErr.message}`);
+      }
+    }
+    throw err;
+  }
+  fsyncDirectory(targetDir, fsOps);
 }
 
 /**
@@ -77,7 +205,18 @@ export function canonicalizePaths(projectPath, filePath) {
       try {
         const canonicalParent = fs.realpathSync.native(parentDir);
         absoluteFilePath = path.join(canonicalParent, path.basename(absoluteFilePath));
-      } catch (_) {}
+      } catch (realpathErr) {
+        if (realpathErr && realpathErr.code !== 'ENOENT') {
+          try {
+            const fallbackParent = fs.realpathSync(parentDir);
+            absoluteFilePath = path.join(fallbackParent, path.basename(absoluteFilePath));
+          } catch (fallbackErr) {
+            if (fallbackErr && fallbackErr.code !== 'ENOENT') {
+              console.warn(`[KruschStateManager] Failed to canonicalize parent directory ${parentDir}: ${fallbackErr.message}`);
+            }
+          }
+        }
+      }
     }
   }
 
@@ -313,7 +452,9 @@ export class KruschStateManager {
           [originalHash, originalContent, Buffer.byteLength(originalContent, 'utf-8')]
         );
       }
-    } catch (_) {}
+    } catch (blobErr) {
+      console.warn(`[KruschStateManager] Non-fatal blob deduplication store warning: ${blobErr.message}`);
+    }
 
     return res.rows[0];
   }
@@ -401,7 +542,11 @@ export class KruschStateManager {
    * 4. Partial batch crash -> roll back already renamed files to base content, unlink temp files,
    *    and revert all diffs in batch to PENDING.
    */
-  static async recoverInFlightApplies(projectPath = null) {
+  static async recoverInFlightApplies(projectPath = null, options = {}) {
+    const fsOps = options?.fsOps || fs;
+    const queryFn = options?.queryFn || query;
+    const withTxFn = options?.withTransactionFn || withTransaction;
+
     let sql = `SELECT * FROM krusch_staged_diffs WHERE status = 'APPLYING' ORDER BY id ASC`;
     const params = [];
     if (projectPath) {
@@ -409,7 +554,7 @@ export class KruschStateManager {
       sql = `SELECT * FROM krusch_staged_diffs WHERE status = 'APPLYING' AND project_path = $1 ORDER BY id ASC`;
       params.push(canonical.projectPath);
     }
-    const res = await query(sql, params);
+    const res = await queryFn(sql, params);
     if (res.rows.length === 0) return [];
 
     // Group diffs by task_id to evaluate multi-file batch atomicity
@@ -424,34 +569,63 @@ export class KruschStateManager {
     const recovered = [];
 
     for (const [taskId, batchDiffs] of taskGroups.entries()) {
-      const inspected = batchDiffs.map(diff => {
-        const fullPath = path.resolve(diff.project_path, diff.file_path);
-        const diskExists = fs.existsSync(fullPath);
-        let diskHash = null;
-        if (diskExists) {
-          const diskContent = fs.readFileSync(fullPath, 'utf-8');
-          diskHash = crypto.createHash('sha256').update(diskContent).digest('hex');
+      let inspected;
+      try {
+        inspected = batchDiffs.map(diff => {
+          const fullPath = path.resolve(diff.project_path, diff.file_path);
+          const { exists: diskExists, content: diskContent } = readTextIfExists(fullPath, fsOps);
+          const diskHash = diskExists
+            ? crypto.createHash('sha256').update(diskContent).digest('hex')
+            : null;
+
+          const isRenamed = diskExists && diskHash === diff.sha256_hash;
+          const isUntouched = (!diskExists && !diff.original_sha256) ||
+            (diskExists && diff.original_sha256 && diskHash === diff.original_sha256);
+          const isDrift = !isRenamed && !isUntouched;
+
+          return {
+            diff,
+            fullPath,
+            diskExists,
+            diskHash,
+            isRenamed,
+            isUntouched,
+            isDrift
+          };
+        });
+
+        // Clean orphaned temp files for all files in this batch (propagating directory EIO/EACCES)
+        for (const item of inspected) {
+          cleanOrphanedTempFiles(item.fullPath, fsOps, { throwOnIoError: true });
+        }
+      } catch (inspectIoErr) {
+        try {
+          await queryFn(
+            `UPDATE krusch_apply_journal SET error_message = $1 WHERE task_id = $2 AND state = 'APPLYING'`,
+            [`COMPOUND_RECOVERY_IO_ERROR: ${inspectIoErr.message}`, taskId]
+          );
+        } catch (dbErr) {
+          console.error(`[KruschStateManager] Failed to update journal error_message during recovery inspection for task ${taskId}: ${dbErr.message}`);
+        }
+        try {
+          await queryFn(
+            `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+             VALUES ($1, NULL, 'recovery_deferred_io_error', $2, NOW())`,
+            [taskId, JSON.stringify({ error: inspectIoErr.message, code: inspectIoErr.code || null, phase: 'inspect' })]
+          );
+        } catch (dbErr) {
+          console.error(`[KruschStateManager] Failed to record recovery_deferred_io_error event for task ${taskId}: ${dbErr.message}`);
         }
 
-        const isRenamed = diskExists && diskHash === diff.sha256_hash;
-        const isUntouched = (!diskExists && !diff.original_sha256) ||
-          (diskExists && diff.original_sha256 && diskHash === diff.original_sha256);
-        const isDrift = !isRenamed && !isUntouched;
-
-        return {
-          diff,
-          fullPath,
-          diskExists,
-          diskHash,
-          isRenamed,
-          isUntouched,
-          isDrift
-        };
-      });
-
-      // Clean orphaned temp files for all files in this batch
-      for (const item of inspected) {
-        cleanOrphanedTempFiles(item.fullPath);
+        if (options?.strict === true) {
+          throw inspectIoErr;
+        }
+        recovered.push({
+          taskId,
+          outcome: 'RECOVERY_DEFERRED_IO_ERROR',
+          error: inspectIoErr.message
+        });
+        continue;
       }
 
       const anyDrift = inspected.some(i => i.isDrift);
@@ -460,82 +634,178 @@ export class KruschStateManager {
 
       if (anyDrift) {
         // Case 3: Drift detected on one or more files in the batch
-        for (const item of inspected) {
-          if (item.isDrift) {
-            await query(`UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE id = $1`, [item.diff.id]);
-            await KruschStateManager.recordEvent(taskId, null, 'drift_detected', {
-              diffId: item.diff.id,
-              filePath: item.diff.file_path,
-              outcome: 'DRIFT_DETECTED_REJECTED',
-              diskHash: item.diskHash,
-              stagedHash: item.diff.sha256_hash,
-              originalHash: item.diff.original_sha256,
-              reason: 'Disk contents modified out-of-band during crash recovery'
-            });
-            recovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'DRIFT_REJECTED' });
-          } else {
-            await query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = $1`, [item.diff.id]);
-            recovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'REVERTED_TO_PENDING' });
+        const batchRecovered = [];
+        await withTxFn(async (client) => {
+          for (const item of inspected) {
+            if (item.isDrift) {
+              await client.query(`UPDATE krusch_staged_diffs SET status = 'REJECTED' WHERE id = $1`, [item.diff.id]);
+              await client.query(
+                `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+                 VALUES ($1, NULL, 'drift_detected', $2, NOW())`,
+                [taskId, JSON.stringify({
+                  diffId: item.diff.id,
+                  filePath: item.diff.file_path,
+                  outcome: 'DRIFT_DETECTED_REJECTED',
+                  diskHash: item.diskHash,
+                  stagedHash: item.diff.sha256_hash,
+                  originalHash: item.diff.original_sha256,
+                  reason: 'Disk contents modified out-of-band during crash recovery'
+                })]
+              );
+              batchRecovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'DRIFT_REJECTED' });
+            } else {
+              await client.query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = $1`, [item.diff.id]);
+              batchRecovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'REVERTED_TO_PENDING' });
+            }
           }
-        }
+          await client.query(
+            `UPDATE krusch_apply_journal
+             SET state = 'FAILED', completed_at = NOW(), error_message = COALESCE(error_message, 'Working tree drift detected during crash recovery')
+             WHERE task_id = $1 AND state = 'APPLYING'`,
+            [taskId]
+          );
+        });
+        recovered.push(...batchRecovered);
       } else if (allRenamed) {
         // Case 1: Complete rename across all files in the batch
-        for (const item of inspected) {
-          await query(`UPDATE krusch_staged_diffs SET status = 'APPLIED', applied_at = NOW() WHERE id = $1`, [item.diff.id]);
-          await KruschStateManager.recordEvent(taskId, null, 'recovery_performed', {
-            diffId: item.diff.id,
-            filePath: item.diff.file_path,
-            outcome: 'MARKED_APPLIED',
-            reason: 'Live disk file matched staged content SHA-256'
-          });
-          recovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'APPLIED' });
-        }
-        await query(`UPDATE krusch_apply_journal SET state = 'APPLIED', completed_at = NOW() WHERE task_id = $1 AND state = 'APPLYING'`, [taskId]);
+        const batchRecovered = [];
+        await withTxFn(async (client) => {
+          for (const item of inspected) {
+            await client.query(`UPDATE krusch_staged_diffs SET status = 'APPLIED', applied_at = NOW() WHERE id = $1`, [item.diff.id]);
+            await client.query(
+              `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+               VALUES ($1, NULL, 'recovery_performed', $2, NOW())`,
+              [taskId, JSON.stringify({
+                diffId: item.diff.id,
+                filePath: item.diff.file_path,
+                outcome: 'MARKED_APPLIED',
+                reason: 'Live disk file matched staged content SHA-256'
+              })]
+            );
+            batchRecovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'APPLIED' });
+          }
+          await client.query(
+            `UPDATE krusch_apply_journal SET state = 'APPLIED', completed_at = NOW(), error_message = NULL WHERE task_id = $1 AND state = 'APPLYING'`,
+            [taskId]
+          );
+        });
+        recovered.push(...batchRecovered);
       } else if (allUntouched) {
         // Case 2: No rename occurred across all files in the batch
-        for (const item of inspected) {
-          await query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = $1`, [item.diff.id]);
-          await KruschStateManager.recordEvent(taskId, null, 'recovery_performed', {
-            diffId: item.diff.id,
-            filePath: item.diff.file_path,
-            outcome: 'REVERTED_TO_PENDING',
-            reason: 'Live disk file matched original base SHA-256; reverted to PENDING'
-          });
-          recovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'REVERTED_TO_PENDING' });
-        }
-        await query(`UPDATE krusch_apply_journal SET state = 'ROLLED_BACK', completed_at = NOW() WHERE task_id = $1 AND state = 'APPLYING'`, [taskId]);
+        const batchRecovered = [];
+        await withTxFn(async (client) => {
+          for (const item of inspected) {
+            await client.query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = $1`, [item.diff.id]);
+            await client.query(
+              `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+               VALUES ($1, NULL, 'recovery_performed', $2, NOW())`,
+              [taskId, JSON.stringify({
+                diffId: item.diff.id,
+                filePath: item.diff.file_path,
+                outcome: 'REVERTED_TO_PENDING',
+                reason: 'Live disk file matched original base SHA-256; reverted to PENDING'
+              })]
+            );
+            batchRecovered.push({ id: item.diff.id, filePath: item.diff.file_path, outcome: 'REVERTED_TO_PENDING' });
+          }
+          await client.query(
+            `UPDATE krusch_apply_journal SET state = 'ROLLED_BACK', completed_at = NOW(), error_message = NULL WHERE task_id = $1 AND state = 'APPLYING'`,
+            [taskId]
+          );
+        });
+        recovered.push(...batchRecovered);
       } else {
         // Case 4: Partial batch crash! Some files were renamed, others were not.
-        // Roll back already renamed files to preserve atomic multi-file apply invariant.
+        // 1. First validate ALL base preimage hashes BEFORE mutating disk.
         for (const item of inspected) {
-          if (item.isRenamed) {
-            if (item.diff.original_sha256 && item.diff.original_content !== null && item.diff.original_content !== undefined) {
-              const preimageHash = crypto.createHash('sha256').update(item.diff.original_content).digest('hex');
-              if (preimageHash !== item.diff.original_sha256) {
-                throw new Error(`CORRUPT_BASE_PREIMAGE: stored original_content SHA-256 (${preimageHash}) does not match recorded base SHA-256 (${item.diff.original_sha256}) for file '${item.diff.file_path}'`);
-              }
-              atomicWriteFile(item.fullPath, item.diff.original_content);
-            } else if (!item.diff.original_sha256) {
-              if (fs.existsSync(item.fullPath)) {
-                try { fs.unlinkSync(item.fullPath); } catch (_) {}
+          if (item.isRenamed && item.diff.original_sha256) {
+            if (item.diff.original_content === null || item.diff.original_content === undefined) {
+              throw new Error(
+                `CORRUPT_BASE_PREIMAGE: missing original_content for recorded base SHA-256 (${item.diff.original_sha256}) on file '${item.diff.file_path}'`
+              );
+            }
+            const preimageHash = crypto.createHash('sha256').update(item.diff.original_content).digest('hex');
+            if (preimageHash !== item.diff.original_sha256) {
+              throw new Error(
+                `CORRUPT_BASE_PREIMAGE: stored original_content SHA-256 (${preimageHash}) does not match recorded base SHA-256 (${item.diff.original_sha256}) for file '${item.diff.file_path}'`
+              );
+            }
+          }
+        }
+
+        // 2. Perform ALL physical disk rollbacks before touching DB status.
+        try {
+          for (const item of inspected) {
+            if (item.isRenamed) {
+              if (item.diff.original_sha256) {
+                atomicWriteFile(item.fullPath, item.diff.original_content, fsOps);
+              } else {
+                const unlinked = unlinkIfExists(item.fullPath, fsOps);
+                if (unlinked) {
+                  fsyncDirectory(path.dirname(item.fullPath), fsOps);
+                }
               }
             }
           }
-          await query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = $1`, [item.diff.id]);
-          await KruschStateManager.recordEvent(taskId, null, 'recovery_performed', {
-            diffId: item.diff.id,
-            filePath: item.diff.file_path,
-            outcome: 'BATCH_ROLLBACK_REVERTED_TO_PENDING',
-            wasRenamed: item.isRenamed,
-            reason: 'Partial batch apply detected on crash recovery; atomically rolled back renamed files to base content'
-          });
+        } catch (ioErr) {
+          // 3. Compound I/O fault during disk rollback: preserve APPLYING state so next recovery heals remaining files!
+          try {
+            await queryFn(
+              `UPDATE krusch_apply_journal SET error_message = $1 WHERE task_id = $2 AND state = 'APPLYING'`,
+              [`COMPOUND_RECOVERY_IO_ERROR: ${ioErr.message}`, taskId]
+            );
+          } catch (dbErr) {
+            console.error(`[KruschStateManager] Failed to update journal error_message during recovery for task ${taskId}: ${dbErr.message}`);
+          }
+          try {
+            await queryFn(
+              `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+               VALUES ($1, NULL, 'recovery_deferred_io_error', $2, NOW())`,
+              [taskId, JSON.stringify({ error: ioErr.message, code: ioErr.code || null, phase: 'rollback' })]
+            );
+          } catch (dbErr) {
+            console.error(`[KruschStateManager] Failed to record recovery_deferred_io_error event for task ${taskId}: ${dbErr.message}`);
+          }
+
+          if (options?.strict === true) {
+            throw ioErr;
+          }
           recovered.push({
-            id: item.diff.id,
-            filePath: item.diff.file_path,
-            outcome: 'BATCH_ROLLBACK_REVERTED_TO_PENDING'
+            taskId,
+            outcome: 'RECOVERY_DEFERRED_IO_ERROR',
+            error: ioErr.message
           });
+          continue;
         }
-        await query(`UPDATE krusch_apply_journal SET state = 'ROLLED_BACK', completed_at = NOW() WHERE task_id = $1 AND state = 'APPLYING'`, [taskId]);
+
+        // 4. Commit PENDING status + ROLLED_BACK journal atomically after all disk rollbacks succeed.
+        const batchRecovered = [];
+        await withTxFn(async (client) => {
+          for (const item of inspected) {
+            await client.query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = $1`, [item.diff.id]);
+            await client.query(
+              `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+               VALUES ($1, NULL, 'recovery_performed', $2, NOW())`,
+              [taskId, JSON.stringify({
+                diffId: item.diff.id,
+                filePath: item.diff.file_path,
+                outcome: 'BATCH_ROLLBACK_REVERTED_TO_PENDING',
+                wasRenamed: item.isRenamed,
+                reason: 'Partial batch apply detected on crash recovery; atomically rolled back renamed files to base content'
+              })]
+            );
+            batchRecovered.push({
+              id: item.diff.id,
+              filePath: item.diff.file_path,
+              outcome: 'BATCH_ROLLBACK_REVERTED_TO_PENDING'
+            });
+          }
+          await client.query(
+            `UPDATE krusch_apply_journal SET state = 'ROLLED_BACK', completed_at = NOW(), error_message = NULL WHERE task_id = $1 AND state = 'APPLYING'`,
+            [taskId]
+          );
+        });
+        recovered.push(...batchRecovered);
       }
     }
 
@@ -545,9 +815,13 @@ export class KruschStateManager {
   /**
    * Apply multiple staged diffs as a single atomic unit (all files or none).
    * Enforces verification requirements, pre-commit drift checks, journaled APPLYING state,
-   * tempfile fsync, and atomic rename rollback.
+   * tempfile fsync, parent directory fsync, and compound-fault-safe rollback.
    */
-  static async applyDiffBatch(taskId, diffIds = null, projectPath = null) {
+  static async applyDiffBatch(taskId, diffIds = null, projectPath = null, options = {}) {
+    const fsOps = options?.fsOps || fs;
+    const queryFn = options?.queryFn || query;
+    const withTxFn = options?.withTransactionFn || withTransaction;
+
     const task = await KruschStateManager.getTask(taskId);
     if (!task) throw new Error(`Task '${taskId}' not found.`);
 
@@ -560,53 +834,80 @@ export class KruschStateManager {
       throw new Error(`Refusing to apply diffs: Ground-truth verification is failing (Exit code: ${latestVerif?.exit_code ?? 'none'}).`);
     }
 
+    const baseProject = projectPath || task.project_path || process.cwd();
+
+    // Pre-flight compound-recovery check: reconcile any residual APPLYING rows from a prior crash/compound-rollback failure
+    let promotedInPreFlight = [];
+    const inFlightRes = await queryFn(
+      `SELECT id FROM krusch_staged_diffs WHERE task_id = $1 AND status = 'APPLYING' ORDER BY id ASC`,
+      [taskId]
+    );
+    if (inFlightRes.rows.length > 0) {
+      const inFlightIds = new Set(inFlightRes.rows.map(r => r.id));
+      const rec = await KruschStateManager.recoverInFlightApplies(baseProject, { ...options, strict: true });
+      promotedInPreFlight = rec.filter(
+        r => r.outcome === 'APPLIED' && inFlightIds.has(r.id) && (!diffIds || diffIds.includes(r.id))
+      );
+    }
+
     // Refuse apply if any requested or active diff is REJECTED
     if (diffIds && diffIds.length > 0) {
-      const explicitRows = await query(`SELECT id, status, file_path FROM krusch_staged_diffs WHERE id = ANY($1::int[])`, [diffIds]);
+      const explicitRows = await queryFn(`SELECT id, status, file_path FROM krusch_staged_diffs WHERE id = ANY($1::int[])`, [diffIds]);
       const rejected = explicitRows.rows.find(r => r.status === 'REJECTED');
       if (rejected) {
         throw new Error(`Refusing to apply diff ${rejected.id} for '${rejected.file_path}': staged diff has been REJECTED (e.g. working tree drift detected). It must be re-staged and re-verified.`);
       }
     } else {
-      const rejectedRows = await query(`SELECT id, status, file_path FROM krusch_staged_diffs WHERE task_id = $1 AND status = 'REJECTED'`, [taskId]);
+      const rejectedRows = await queryFn(`SELECT id, status, file_path FROM krusch_staged_diffs WHERE task_id = $1 AND status = 'REJECTED'`, [taskId]);
       if (rejectedRows.rows.length > 0) {
         throw new Error(`Refusing to apply diffs: Task '${taskId}' has ${rejectedRows.rows.length} REJECTED staged diff(s) (e.g. '${rejectedRows.rows[0].file_path}'). Modifications must be re-staged and re-verified before applying.`);
       }
     }
 
-    const pendingDiffs = await KruschStateManager.getPendingDiffs(taskId);
+    const pendingRes = await queryFn(
+      `SELECT * FROM krusch_staged_diffs WHERE task_id = $1 AND status = 'PENDING' ORDER BY id ASC`,
+      [taskId]
+    );
+    const pendingDiffs = pendingRes.rows;
     const targets = diffIds
       ? pendingDiffs.filter(d => diffIds.includes(d.id))
       : pendingDiffs;
 
     if (targets.length === 0) {
+      if (promotedInPreFlight.length > 0) {
+        return {
+          status: 'APPLIED',
+          appliedCount: promotedInPreFlight.length,
+          diffs: promotedInPreFlight.map(r => ({ id: r.id, filePath: r.filePath }))
+        };
+      }
       return { status: 'NOOP', appliedCount: 0, message: 'No pending staged diffs to apply.' };
     }
 
-    const baseProject = projectPath || task.project_path || process.cwd();
-    const preparedFiles = [];
-
-    // Step 1: Pre-Commit Drift Detection across ALL target files before touching disk
+    // Step 1: Pre-Commit Drift Detection across ALL target files before mutating disk
+    const verifiedTargets = [];
     for (const diff of targets) {
       const canonical = canonicalizePaths(baseProject, diff.file_path);
       const fullPath = path.resolve(canonical.projectPath, canonical.filePath);
       const targetDir = path.dirname(fullPath);
-      fs.mkdirSync(targetDir, { recursive: true });
 
-      const diskExists = fs.existsSync(fullPath);
-      const diskContent = diskExists ? fs.readFileSync(fullPath, 'utf-8') : null;
+      const { exists: diskExists, content: diskContent } = readTextIfExists(fullPath, fsOps);
       const diskHash = (diskContent !== null && diskContent !== '')
         ? crypto.createHash('sha256').update(diskContent).digest('hex')
         : null;
 
       const expectedHash = diff.original_sha256 || null;
       if (diskHash !== expectedHash) {
-        await KruschStateManager.recordEvent(taskId, null, 'drift_detected', {
-          diffId: diff.id,
-          filePath: diff.file_path,
-          expectedHash,
-          currentDiskHash: diskHash
-        });
+        await queryFn(
+          `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+           VALUES ($1, NULL, 'drift_detected', $2, NOW())`,
+          [taskId, JSON.stringify({
+            diffId: diff.id,
+            filePath: diff.file_path,
+            expectedHash,
+            currentDiskHash: diskHash
+          })]
+        );
         const driftErr = new Error(
           `Refusing to apply staged diff to disk: working tree file '${diff.file_path}' was modified after diff was staged. Expected base hash: ${expectedHash || 'none'}, current disk hash: ${diskHash || 'none'}. Staged diff must be rebased and re-verified.`
         );
@@ -614,21 +915,71 @@ export class KruschStateManager {
         throw driftErr;
       }
 
-      // Step 2: Write temporary sibling file and fsync to storage media
-      const randSuffix = crypto.randomBytes(4).toString('hex');
-      const tempPath = path.resolve(targetDir, `.${path.basename(fullPath)}.krusch-tmp-${Date.now()}-${randSuffix}`);
-      const fd = fs.openSync(tempPath, 'w');
-      fs.writeSync(fd, diff.staged_content);
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
-
-      preparedFiles.push({
+      verifiedTargets.push({
         diff,
-        tempPath,
         fullPath,
+        targetDir,
         originalContent: diskContent,
         diskExisted: diskExists
       });
+    }
+
+    // Step 2: Write temporary sibling files and fsync to storage media (closing fd & unlinking all temp files on error)
+    const preparedFiles = [];
+    try {
+      for (const item of verifiedTargets) {
+        fsOps.mkdirSync(item.targetDir, { recursive: true });
+        const randSuffix = crypto.randomBytes(4).toString('hex');
+        const tempPath = path.resolve(item.targetDir, `.${path.basename(item.fullPath)}.krusch-tmp-${Date.now()}-${randSuffix}`);
+        const fd = fsOps.openSync(tempPath, 'w');
+        try {
+          let writeErr = null;
+          try {
+            writeAllSync(fd, item.diff.staged_content, tempPath, fsOps);
+            fsOps.fsyncSync(fd);
+          } catch (err) {
+            writeErr = err;
+            throw err;
+          } finally {
+            try {
+              fsOps.closeSync(fd);
+            } catch (closeErr) {
+              if (!writeErr) {
+                throw closeErr;
+              }
+              console.warn(`[KruschStateManager] Failed to close temp fd for ${tempPath}: ${closeErr.message}`);
+            }
+          }
+        } catch (tempErr) {
+          try {
+            fsOps.unlinkSync(tempPath);
+          } catch (unlinkErr) {
+            if (unlinkErr && unlinkErr.code !== 'ENOENT') {
+              console.warn(`[KruschStateManager] Failed to unlink failed temp file ${tempPath}: ${unlinkErr.message}`);
+            }
+          }
+          throw tempErr;
+        }
+
+        preparedFiles.push({
+          diff: item.diff,
+          tempPath,
+          fullPath: item.fullPath,
+          originalContent: item.originalContent,
+          diskExisted: item.diskExisted
+        });
+      }
+    } catch (prepErr) {
+      for (const prep of preparedFiles) {
+        try {
+          fsOps.unlinkSync(prep.tempPath);
+        } catch (unlinkErr) {
+          if (unlinkErr && unlinkErr.code !== 'ENOENT') {
+            console.warn(`[KruschStateManager] Failed to unlink prepared temp file ${prep.tempPath}: ${unlinkErr.message}`);
+          }
+        }
+      }
+      throw prepErr;
     }
 
     const targetIds = targets.map(d => d.id);
@@ -642,21 +993,39 @@ export class KruschStateManager {
       fullPath: f.fullPath
     }));
 
-    const journalRes = await query(`
-      INSERT INTO krusch_apply_journal (task_id, project_path, state, files, created_at)
-      VALUES ($1, $2, 'APPLYING', $3, NOW())
-      RETURNING id;
-    `, [taskId, baseProject, JSON.stringify(journalPayload)]);
-    const journalId = journalRes.rows[0]?.id;
+    let journalId;
+    try {
+      const journalRes = await queryFn(`
+        INSERT INTO krusch_apply_journal (task_id, project_path, state, files, created_at)
+        VALUES ($1, $2, 'APPLYING', $3, NOW())
+        RETURNING id;
+      `, [taskId, baseProject, JSON.stringify(journalPayload)]);
+      journalId = journalRes.rows[0]?.id;
 
-    // Journal APPLYING intent on staged diffs
-    await query(`UPDATE krusch_staged_diffs SET status = 'APPLYING' WHERE id = ANY($1::int[])`, [targetIds]);
-    for (const diff of targets) {
-      await KruschStateManager.recordEvent(taskId, null, 'apply_started', {
-        diffId: diff.id,
-        filePath: diff.file_path,
-        journalId
-      });
+      // Journal APPLYING intent on staged diffs
+      await queryFn(`UPDATE krusch_staged_diffs SET status = 'APPLYING' WHERE id = ANY($1::int[])`, [targetIds]);
+      for (const diff of targets) {
+        await queryFn(
+          `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+           VALUES ($1, NULL, 'apply_started', $2, NOW())`,
+          [taskId, JSON.stringify({
+            diffId: diff.id,
+            filePath: diff.file_path,
+            journalId
+          })]
+        );
+      }
+    } catch (journalErr) {
+      for (const prep of preparedFiles) {
+        try {
+          fsOps.unlinkSync(prep.tempPath);
+        } catch (unlinkErr) {
+          if (unlinkErr && unlinkErr.code !== 'ENOENT') {
+            console.warn(`[KruschStateManager] Failed to unlink temp file ${prep.tempPath} after journal error: ${unlinkErr.message}`);
+          }
+        }
+      }
+      throw journalErr;
     }
 
     // Test hook for deterministic mid-apply crash testing before any rename (strictly test-only)
@@ -669,23 +1038,33 @@ export class KruschStateManager {
         process.send({ readyForKill: true });
       }
       if (process.env.KRUSCH_TEST_HOOK_MARKER_FILE) {
-        try { fs.writeFileSync(process.env.KRUSCH_TEST_HOOK_MARKER_FILE, 'ready', 'utf-8'); } catch (_) {}
+        try {
+          fsOps.writeFileSync(process.env.KRUSCH_TEST_HOOK_MARKER_FILE, 'ready', 'utf-8');
+        } catch (hookErr) {
+          console.warn(`[KruschStateManager] Test hook marker write failed: ${hookErr.message}`);
+        }
       }
       // Pause and await SIGKILL from parent test runner
       await new Promise(resolve => setTimeout(resolve, 30000));
     }
 
-    // Step 4: Atomic POSIX Rename for all files with complete rollback on failure
+    // Step 4: Atomic POSIX Rename for all files with compound-fault-safe rollback on failure
     const renamedSoFar = [];
     try {
       for (const item of preparedFiles) {
-        fs.renameSync(item.tempPath, item.fullPath);
+        fsOps.renameSync(item.tempPath, item.fullPath);
+        item.tempPath = null;
         renamedSoFar.push(item);
-        await KruschStateManager.recordEvent(taskId, null, 'apply_fsync', {
-          diffId: item.diff.id,
-          filePath: item.diff.file_path,
-          journalId
-        });
+        fsyncDirectory(path.dirname(item.fullPath), fsOps);
+        await queryFn(
+          `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+           VALUES ($1, NULL, 'apply_fsync', $2, NOW())`,
+          [taskId, JSON.stringify({
+            diffId: item.diff.id,
+            filePath: item.diff.file_path,
+            journalId
+          })]
+        );
 
         // Test hook for deterministic mid-apply crash testing
         if (allowHooks && process.env.KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME && renamedSoFar.length === 1) {
@@ -693,7 +1072,11 @@ export class KruschStateManager {
             process.send({ readyForKill: true });
           }
           if (process.env.KRUSCH_TEST_HOOK_MARKER_FILE) {
-            try { fs.writeFileSync(process.env.KRUSCH_TEST_HOOK_MARKER_FILE, 'ready', 'utf-8'); } catch (_) {}
+            try {
+              fsOps.writeFileSync(process.env.KRUSCH_TEST_HOOK_MARKER_FILE, 'ready', 'utf-8');
+            } catch (hookErr) {
+              console.warn(`[KruschStateManager] Test hook marker write failed: ${hookErr.message}`);
+            }
           }
           if (process.env.KRUSCH_TEST_HOOK_SIMULATE_SIGKILL_IN_PROCESS === '1') {
             return { abortedMidBatch: true, signal: 'SIGKILL' };
@@ -701,61 +1084,134 @@ export class KruschStateManager {
           // Pause and await SIGKILL from parent test runner
           await new Promise(resolve => setTimeout(resolve, 30000));
         }
-
       }
     } catch (renameErr) {
-      // Rollback already renamed files using atomicWriteFile
+      const rollbackErrors = [];
       for (const item of renamedSoFar) {
         try {
           if (item.diskExisted) {
-            atomicWriteFile(item.fullPath, item.originalContent);
+            atomicWriteFile(item.fullPath, item.originalContent ?? '', fsOps);
           } else {
-            fs.unlinkSync(item.fullPath);
+            const unlinked = unlinkIfExists(item.fullPath, fsOps);
+            if (unlinked) {
+              fsyncDirectory(path.dirname(item.fullPath), fsOps);
+            }
           }
-        } catch (_) {}
-      }
-      // Clean up remaining temp files
-      for (const item of preparedFiles) {
-        if (fs.existsSync(item.tempPath)) {
-          try { fs.unlinkSync(item.tempPath); } catch (_) {}
+        } catch (rbErr) {
+          if (rbErr?.code !== 'ENOENT') {
+            rollbackErrors.push({
+              filePath: item.diff.file_path,
+              error: rbErr.message,
+              code: rbErr.code || null
+            });
+          }
         }
       }
-      // Mark journal as ROLLED_BACK
-      if (journalId) {
-        await query(`
-          UPDATE krusch_apply_journal
-          SET state = 'ROLLED_BACK', completed_at = NOW(), error_message = $1
-          WHERE id = $2
-        `, [renameErr.message, journalId]);
+
+      // Clean up remaining temp files
+      for (const item of preparedFiles) {
+        if (item.tempPath) {
+          try {
+            fsOps.unlinkSync(item.tempPath);
+          } catch (cleanupErr) {
+            if (cleanupErr?.code !== 'ENOENT') {
+              console.warn(`[KruschStateManager] Failed to unlink temp file ${item.tempPath} after apply failure: ${cleanupErr.message}`);
+            }
+          }
+          item.tempPath = null;
+        }
       }
 
-      // Revert DB state back to PENDING
-      await query(`UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = ANY($1::int[])`, [targetIds]);
-      await KruschStateManager.recordEvent(taskId, null, 'apply_failed', {
-        error: renameErr.message,
-        targetIds,
-        journalId
+      if (rollbackErrors.length > 0) {
+        // Case 4B: Compound failure during rollback!
+        // Preserve APPLYING status in both krusch_staged_diffs and krusch_apply_journal so recovery heals torn disk state.
+        const rollbackSummary = rollbackErrors.map(e => `${e.filePath}:${e.error}`).join(', ');
+        const compoundMessage = `COMPOUND_ROLLBACK_FAILED: primary=${renameErr.message}; rollback=${rollbackSummary}`;
+        if (journalId) {
+          try {
+            await queryFn(
+              `UPDATE krusch_apply_journal SET error_message = $1 WHERE id = $2`,
+              [compoundMessage, journalId]
+            );
+          } catch (dbErr) {
+            console.error(`[KruschStateManager] Failed to update journal ${journalId} after compound rollback error: ${dbErr.message}`);
+          }
+        }
+        try {
+          await queryFn(
+            `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+             VALUES ($1, NULL, 'apply_rollback_failed', $2, NOW())`,
+            [taskId, JSON.stringify({
+              primaryError: renameErr.message,
+              rollbackErrors,
+              targetIds,
+              journalId
+            })]
+          );
+        } catch (dbErr) {
+          console.error(`[KruschStateManager] Failed to record apply_rollback_failed event for task ${taskId}: ${dbErr.message}`);
+        }
+
+        const compoundErr = new Error(compoundMessage);
+        compoundErr.code = 'COMPOUND_ROLLBACK_FAILED';
+        compoundErr.rollbackErrors = rollbackErrors;
+        throw compoundErr;
+      }
+
+      // Case 4A: Clean single-fault rollback
+      await withTxFn(async (client) => {
+        if (journalId) {
+          await client.query(
+            `UPDATE krusch_apply_journal
+             SET state = 'ROLLED_BACK', completed_at = NOW(), error_message = $1
+             WHERE id = $2`,
+            [renameErr.message, journalId]
+          );
+        }
+        await client.query(
+          `UPDATE krusch_staged_diffs SET status = 'PENDING' WHERE id = ANY($1::int[])`,
+          [targetIds]
+        );
+        await client.query(
+          `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+           VALUES ($1, NULL, 'apply_failed', $2, NOW())`,
+          [taskId, JSON.stringify({
+            error: renameErr.message,
+            targetIds,
+            journalId
+          })]
+        );
       });
+
       throw new Error(`MULTI_FILE_APPLY_FAILED: ${renameErr.message}`);
     }
 
-    // Step 5: Mark all rows as APPLIED in PostgreSQL and complete journal
-    await query(`UPDATE krusch_staged_diffs SET status = 'APPLIED', applied_at = NOW() WHERE id = ANY($1::int[])`, [targetIds]);
-    if (journalId) {
-      await query(`
-        UPDATE krusch_apply_journal
-        SET state = 'APPLIED', completed_at = NOW()
-        WHERE id = $1
-      `, [journalId]);
-    }
-
-    for (const diff of targets) {
-      await KruschStateManager.recordEvent(taskId, null, 'apply_completed', {
-        diffId: diff.id,
-        filePath: diff.file_path,
-        journalId
-      });
-    }
+    // Step 5: Atomically mark all rows as APPLIED in PostgreSQL and complete journal
+    await withTxFn(async (client) => {
+      await client.query(
+        `UPDATE krusch_staged_diffs SET status = 'APPLIED', applied_at = NOW() WHERE id = ANY($1::int[])`,
+        [targetIds]
+      );
+      if (journalId) {
+        await client.query(
+          `UPDATE krusch_apply_journal
+           SET state = 'APPLIED', completed_at = NOW(), error_message = NULL
+           WHERE id = $1`,
+          [journalId]
+        );
+      }
+      for (const diff of targets) {
+        await client.query(
+          `INSERT INTO krusch_events (task_id, turn_id, event_type, payload, created_at)
+           VALUES ($1, NULL, 'apply_completed', $2, NOW())`,
+          [taskId, JSON.stringify({
+            diffId: diff.id,
+            filePath: diff.file_path,
+            journalId
+          })]
+        );
+      }
+    });
 
     return {
       status: 'APPLIED',

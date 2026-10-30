@@ -121,6 +121,9 @@ export interface TaskSymbolRecord {
   created_at: string;
 }
 
+export function cleanOrphanedTempFiles(fullPath: string, fsOps?: any, options?: { throwOnIoError?: boolean }): void;
+export function fsyncDirectory(dirPath: string, fsOps?: any): void;
+export function atomicWriteFile(targetPath: string, content: string | Buffer | Uint8Array, fsOps?: any): void;
 export function canonicalizePaths(projectPath: string, filePath: string): { projectPath: string; filePath: string };
 
 export class KruschFSM {
@@ -185,11 +188,18 @@ export class KruschStateManager {
 
   static listActiveLeases(projectPath?: string | null): Promise<any[]>;
 
-  static recoverInFlightApplies(projectPath?: string | null): Promise<any[]>;
+  static recoverInFlightApplies(projectPath?: string | null, options?: Record<string, any>): Promise<any[]>;
 
-  static applyDiffBatch(taskId: string, diffIds?: number[] | null, projectPath?: string | null): Promise<{
+  static applyDiffBatch(
+    taskId: string,
+    diffIds?: number[] | null,
+    projectPath?: string | null,
+    options?: Record<string, any>
+  ): Promise<{
     status: string;
     appliedCount: number;
+    journalId?: number;
+    message?: string;
     diffs?: Array<{ id: number; filePath: string }>;
   }>;
 
